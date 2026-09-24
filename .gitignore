@@ -1,0 +1,21 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+out/
+compile_commands.json
+
+# IDEs
+.vscode/
+.idea/
+.vs/
+*.user
+CMakeLists.txt.user*
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Packaged builds
+dist/
