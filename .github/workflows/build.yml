@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build qt6-base-dev libgl1-mesa-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          arch: win64_mingw
+          tools: tools_mingw1310
+
+      - name: Configure
+        shell: bash
+        run: |
+          export PATH="$IQTA_TOOLS/mingw1310_64/bin:$PATH"
+          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="$IQTA_TOOLS/mingw1310_64/bin:$PATH"
+          cmake --build build -j 4
+
+      - name: Test
+        shell: bash
+        run: |
+          export PATH="$IQTA_TOOLS/mingw1310_64/bin:$QT_ROOT_DIR/bin:$PATH"
+          ctest --test-dir build --output-on-failure
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/broadband
+          cp build/broadband.exe dist/broadband/
+          "$QT_ROOT_DIR/bin/windeployqt.exe" --release --no-translations --no-opengl-sw \
+            --no-system-d3d-compiler dist/broadband/broadband.exe
+          cp LICENSE dist/broadband/LICENSE.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: broadband-windows-x64
+          path: dist/broadband

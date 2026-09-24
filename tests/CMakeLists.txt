@@ -1,0 +1,6 @@
+foreach(name tst_speedtest tst_report)
+    qt_add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name} PRIVATE broadband_core Qt6::Test)
+    broadband_set_warnings(${name})
+    add_test(NAME ${name} COMMAND ${name})
+endforeach()
