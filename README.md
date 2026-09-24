@@ -279,4 +279,7 @@ Das Programm ist bewusst klein gehalten und lässt sich vollständig prüfen:
 
 ## Lizenz
 
-[MIT](LICENSE)
+Copyright (c) 2026 The broadband contributors
+
+Dieses Projekt steht unter der [GNU General Public License, Version 3](LICENSE)
+(SPDX: `GPL-3.0-only`).

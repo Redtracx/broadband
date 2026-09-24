@@ -16,7 +16,7 @@ BEGIN
             VALUE "FileDescription", "broadband - bandwidth and speed test"
             VALUE "FileVersion", "@PROJECT_VERSION@"
             VALUE "InternalName", "broadband"
-            VALUE "LegalCopyright", "MIT License"
+            VALUE "LegalCopyright", "Copyright (c) 2026 The broadband contributors; GPL-3.0-only"
             VALUE "OriginalFilename", "broadband.exe"
             VALUE "ProductName", "broadband"
             VALUE "ProductVersion", "@PROJECT_VERSION@"
