@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ContractCheck.h"
 #include "LoadTest.h"
 #include "Report.h"
 #include "SpeedTest.h"
@@ -41,12 +42,19 @@ private:
 
     QWidget *createSpeedTestTab();
     QWidget *createLoadTestTab();
+    QWidget *createContractTab();
     QWidget *createServerTab();
     QWidget *createTile(const QString &title, const QString &unit, Tile &tile);
 
     void loadSettings();
     void saveSettings() const;
     bool serverUrl(QUrl &url);
+    http::IpVersion ipVersion() const;
+    void showServerInfo(const http::ServerInfo &info);
+    void loadHistory();
+    void addHistoryRow(const SpeedRun &run);
+    void showLoadResults();
+    void saveHistoryError(const QString &error);
     void updateRunningState();
     // Waits between two runs of a series, with a countdown in the status label.
     void startPause(int seconds, QLabel *status, std::function<void()> next);
@@ -74,6 +82,11 @@ private:
     void onLoadFinished();
     void updateContractLine();
 
+    // Contract check
+    contract::Contract currentContract() const;
+    void updateContractCheck();
+    void startMeasurementBlock();
+
     // LAN server
     void toggleServer();
     void updateServerStatus();
@@ -83,6 +96,9 @@ private:
     TestServer *m_server = nullptr;
     QTabWidget *m_tabs = nullptr;
     QComboBox *m_serverUrl = nullptr;
+    QComboBox *m_ipVersion = nullptr;
+    QLabel *m_serverInfo = nullptr;
+    QString m_historyPath;
     QTimer m_pauseTimer;
     int m_pauseRemaining = 0;
     QLabel *m_pauseStatus = nullptr;
@@ -134,7 +150,21 @@ private:
     bool m_loadSeriesActive = false;
     int m_loadRun = 0;
     int m_loadRunTotal = 0;
+    int m_lastLoadSeries = 0;
     QDateTime m_loadRunStart;
+
+    // Contract tab
+    struct SpeedInputs
+    {
+        QSpinBox *max = nullptr;
+        QSpinBox *normal = nullptr;
+        QSpinBox *min = nullptr;
+    };
+    SpeedInputs m_contractDown;
+    SpeedInputs m_contractUp;
+    QTableWidget *m_contractDays = nullptr;
+    QLabel *m_contractSummary = nullptr;
+    QPushButton *m_blockButton = nullptr;
 
     // Server tab
     QSpinBox *m_port = nullptr;

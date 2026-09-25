@@ -1,7 +1,5 @@
 #include "SpeedTest.h"
 
-#include "HttpCommon.h"
-
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 
@@ -18,6 +16,8 @@ constexpr qint64 kSmoothingWindowMs = 1000;
 // The first part of every transfer phase is ignored for the final value, so
 // TCP slow start and connection setup don't drag the result down.
 constexpr double kWarmupFraction = 0.2;
+// Pause between two pings while downloading or uploading.
+constexpr int kLoadedPingIntervalMs = 250;
 
 // Mean absolute difference between consecutive samples (as in RFC 3550).
 double jitter(const QList<double> &values)
@@ -34,7 +34,7 @@ double jitter(const QList<double> &values)
 
 SpeedTest::SpeedTest(QObject *parent)
     : QObject(parent)
-    , m_nam(new QNetworkAccessManager(this))
+    , m_pingNam(new QNetworkAccessManager(this))
 {
     m_sampleTimer.setInterval(kSampleIntervalMs);
     m_sampleTimer.setTimerType(Qt::PreciseTimer);
@@ -56,19 +56,38 @@ void SpeedTest::start(const SpeedTestConfig &config)
     stop();
 
     m_config = config;
-    m_config.streams = std::clamp(m_config.streams, 1, 6);
+    m_config.streams = std::clamp(m_config.streams, 1, kMaxStreams);
     m_config.durationSec = std::max(1, m_config.durationSec);
     m_config.pingCount = std::max(1, m_config.pingCount);
     m_result = {};
     m_pings.clear();
     m_pingsDone = 0;
 
-    m_nam->clearConnectionCache();
-    m_nam->setProxy(http::proxyFor(m_config.baseUrl));
-
     setPhase(Phase::Latency);
     emit progressChanged(0.0);
-    sendPing();
+
+    const int generation = m_generation;
+    http::resolveTarget(m_config.baseUrl, m_config.ipVersion, this,
+                        [this, generation](const http::Target &target, const QString &error) {
+                            if (generation != m_generation || !isRunning())
+                                return;
+                            if (!error.isEmpty()) {
+                                fail(error);
+                                return;
+                            }
+                            m_target = target;
+                            releaseStreams();
+
+                            const QNetworkProxy proxy = http::proxyFor(m_config.baseUrl);
+                            m_pingNam->clearConnectionCache();
+                            m_pingNam->setProxy(proxy);
+                            for (int i = 0; i < m_config.streams; ++i) {
+                                auto *nam = new QNetworkAccessManager(this);
+                                nam->setProxy(proxy);
+                                m_streamNams.append(nam);
+                            }
+                            sendPing();
+                        });
 }
 
 void SpeedTest::stop()
@@ -76,6 +95,7 @@ void SpeedTest::stop()
     if (!isRunning())
         return;
     abortAll();
+    releaseStreams();
     setPhase(Phase::Idle);
 }
 
@@ -90,15 +110,19 @@ void SpeedTest::setPhase(Phase phase)
 void SpeedTest::fail(const QString &message)
 {
     abortAll();
+    releaseStreams();
     setPhase(Phase::Idle);
     emit failed(message);
 }
 
 void SpeedTest::abortAll()
 {
+    ++m_generation;
     m_sampleTimer.stop();
-    const auto replies = std::exchange(m_replies, {});
-    for (QNetworkReply *reply : replies) {
+    auto replies = std::exchange(m_replies, {});
+    if (m_pingReply)
+        replies.append(std::exchange(m_pingReply, nullptr));
+    for (QNetworkReply *reply : std::as_const(replies)) {
         reply->disconnect(this);
         reply->abort();
         reply->deleteLater();
@@ -106,23 +130,40 @@ void SpeedTest::abortAll()
     m_uploadProgress.clear();
 }
 
+void SpeedTest::releaseStreams()
+{
+    // Deferred: this may run inside a signal of one of their replies.
+    for (QNetworkAccessManager *nam : std::exchange(m_streamNams, {}))
+        nam->deleteLater();
+}
+
+void SpeedTest::takeServerInfo(const QNetworkReply *reply)
+{
+    if (http::updateServerInfo(m_result.server, reply))
+        emit serverInfoChanged(m_result.server);
+}
+
 // --- Latency ----------------------------------------------------------------
 
 void SpeedTest::sendPing()
 {
-    const QUrl url = http::endpoint(m_config.baseUrl, QStringLiteral("__down"), 0);
-    QNetworkReply *reply = m_nam->get(http::makeRequest(url));
-    m_replies.append(reply);
+    m_pingReply = m_pingNam->get(m_target.request(QStringLiteral("__down"), 0));
     m_pingTimer.start();
-    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    connect(m_pingReply, &QNetworkReply::finished, this, [this] {
         const double elapsedMs = double(m_pingTimer.nsecsElapsed()) / 1e6;
-        m_replies.removeOne(reply);
+        QNetworkReply *reply = std::exchange(m_pingReply, nullptr);
         reply->deleteLater();
 
+        if (m_phase != Phase::Latency) {
+            // A lost ping under load is no reason to abort.
+            onLoadedPingFinished(reply->error() == QNetworkReply::NoError ? elapsedMs : -1.0);
+            return;
+        }
         if (reply->error() != QNetworkReply::NoError) {
             fail(tr("Latenzmessung fehlgeschlagen: %1").arg(reply->errorString()));
             return;
         }
+        takeServerInfo(reply);
         onPingFinished(elapsedMs);
     });
 }
@@ -147,6 +188,20 @@ void SpeedTest::onPingFinished(double elapsedMs)
     startTransfer(Phase::Download);
 }
 
+void SpeedTest::onLoadedPingFinished(double elapsedMs)
+{
+    // Pings during the warm-up are not representative yet.
+    if (elapsedMs >= 0.0 && m_warmupBytes >= 0)
+        m_loadedPings.append(elapsedMs);
+
+    const int generation = m_generation;
+    QTimer::singleShot(kLoadedPingIntervalMs, this, [this, generation] {
+        if (generation == m_generation && !m_pingReply &&
+            (m_phase == Phase::Download || m_phase == Phase::Upload))
+            sendPing();
+    });
+}
+
 // --- Download / upload ------------------------------------------------------
 
 void SpeedTest::startTransfer(Phase phase)
@@ -155,28 +210,34 @@ void SpeedTest::startTransfer(Phase phase)
     emit progressChanged(0.0);
 
     m_bytes = 0;
+    m_phaseErrors = 0;
     m_window = {{0, 0}};
     m_warmupBytes = -1;
     m_warmupMs = qint64(m_config.durationSec * 1000 * kWarmupFraction);
+    m_loadedPings.clear();
 
     m_phaseTimer.start();
     for (int i = 0; i < m_config.streams; ++i)
-        launchStream();
+        launchStream(i);
     m_sampleTimer.start();
+    if (!m_pingReply)
+        sendPing();
 }
 
-void SpeedTest::launchStream()
+void SpeedTest::launchStream(int slot)
 {
-    QNetworkReply *reply = nullptr;
+    QNetworkAccessManager *nam = m_streamNams.value(slot);
+    if (!nam)
+        return;
 
+    QNetworkReply *reply = nullptr;
     if (m_phase == Phase::Download) {
-        reply = m_nam->get(
-            http::makeRequest(http::endpoint(m_config.baseUrl, QStringLiteral("__down"), http::kDownloadChunk)));
+        reply = nam->get(m_target.request(QStringLiteral("__down"), http::kDownloadChunk));
         connect(reply, &QNetworkReply::readyRead, this, [this, reply] {
             m_bytes += reply->readAll().size();
         });
     } else {
-        reply = m_nam->post(http::makeUploadRequest(m_config.baseUrl), http::uploadPayload());
+        reply = nam->post(m_target.uploadRequest(), http::uploadPayload());
         m_uploadProgress.insert(reply, 0);
         connect(reply, &QNetworkReply::uploadProgress, this, [this, reply](qint64 sent, qint64) {
             qint64 &last = m_uploadProgress[reply];
@@ -188,18 +249,38 @@ void SpeedTest::launchStream()
     }
 
     m_replies.append(reply);
-    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, slot] {
         m_replies.removeOne(reply);
         m_uploadProgress.remove(reply);
         reply->deleteLater();
 
         if (reply->error() != QNetworkReply::NoError) {
-            const QString what = m_phase == Phase::Download ? tr("Download") : tr("Upload");
-            fail(tr("%1 fehlgeschlagen: %2").arg(what, reply->errorString()));
+            onStreamError(slot, reply);
             return;
         }
+        takeServerInfo(reply);
         // Keep the pipe full until the phase is over.
-        launchStream();
+        launchStream(slot);
+    });
+}
+
+void SpeedTest::onStreamError(int slot, QNetworkReply *reply)
+{
+    const QString what = m_phase == Phase::Download ? tr("Download") : tr("Upload");
+    // A single dropped connection should not cost the whole measurement, but
+    // a server that rejects the request or keeps failing ends the test.
+    const int maxErrors = std::max(3, 2 * m_config.streams);
+    if (http::isClientError(reply) || ++m_phaseErrors > maxErrors) {
+        fail(tr("%1 fehlgeschlagen: %2").arg(what, reply->errorString()));
+        return;
+    }
+
+    ++m_result.retries;
+    const int generation = m_generation;
+    const Phase phase = m_phase;
+    QTimer::singleShot(http::kRetryDelayMs, this, [this, generation, phase, slot] {
+        if (generation == m_generation && m_phase == phase)
+            launchStream(slot);
     });
 }
 
@@ -237,20 +318,24 @@ void SpeedTest::finishTransfer()
     const qint64 startMs = m_warmupBytes >= 0 ? m_warmupMs : 0;
     const qint64 ms = now - startMs;
     const double mbps = ms > 0 ? double(totalBytes - startBytes) * 8.0 / (double(ms) * 1000.0) : 0.0;
+    const double loadedLatency = m_loadedPings.isEmpty() ? -1.0 : http::median(m_loadedPings);
 
     const Phase phase = m_phase;
     if (phase == Phase::Download) {
         m_result.downloadMbps = mbps;
         m_result.downloadedBytes = totalBytes;
+        m_result.downloadLatencyMs = loadedLatency;
     } else {
         m_result.uploadMbps = mbps;
         m_result.uploadedBytes = totalBytes;
+        m_result.uploadLatencyMs = loadedLatency;
     }
     emit phaseFinished(phase, mbps);
 
     if (phase == Phase::Download) {
         startTransfer(Phase::Upload);
     } else {
+        releaseStreams();
         setPhase(Phase::Done);
         emit finished(m_result);
     }

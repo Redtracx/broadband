@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "Format.h"
+#include "History.h"
 #include "TestServer.h"
 #include "ThroughputChart.h"
 
@@ -12,6 +13,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -115,6 +117,74 @@ QString findingsHtml(const QList<Finding> &findings)
     return lines.join(QStringLiteral("<br>"));
 }
 
+QString loadedLatencyText(const SpeedTestResult &r)
+{
+    const auto value = [](double ms) { return ms < 0 ? QStringLiteral("–") : fmt::ms(ms); };
+    if (r.downloadLatencyMs < 0 && r.uploadLatencyMs < 0)
+        return QStringLiteral("–");
+    return QStringLiteral("%1 / %2").arg(value(r.downloadLatencyMs), value(r.uploadLatencyMs));
+}
+
+QString timeText(const QDateTime &time)
+{
+    return time.date() == QDate::currentDate() ? time.toString(QStringLiteral("HH:mm:ss"))
+                                               : QLocale().toString(time, QStringLiteral("dd.MM.yy HH:mm"));
+}
+
+// "https://speed.cloudflare.com · FRA · IPv4"
+QString serverText(const SpeedRun &run)
+{
+    QStringList parts{run.server};
+    if (!run.result.server.colo.isEmpty())
+        parts << run.result.server.colo;
+    if (run.ipVersion)
+        parts << QStringLiteral("IPv%1").arg(run.ipVersion);
+    return parts.join(QStringLiteral(" · "));
+}
+
+void addLoadRow(QTableWidget *table, int run, const LoadStageResult &result, int contractMbps)
+{
+    const int row = table->rowCount();
+    table->insertRow(row);
+    table->setItem(row, 0, cell(QString::number(run), Qt::AlignCenter));
+    table->setItem(row, 1, cell(QString::number(result.clients)));
+    table->setItem(row, 2, cell(fmt::mbps(result.totalMbps)));
+
+    auto *contractCell = cell(QStringLiteral("–"));
+    if (contractMbps > 0) {
+        const double fraction = result.totalMbps / contractMbps;
+        contractCell->setText(QStringLiteral("%1 %").arg(qRound(fraction * 100)));
+        contractCell->setForeground(ratingColor(fraction));
+        QFont font = contractCell->font();
+        font.setBold(true);
+        contractCell->setFont(font);
+    }
+    table->setItem(row, 3, contractCell);
+
+    table->setItem(row, 4, cell(fmt::mbps(result.clientAvgMbps)));
+    table->setItem(row, 5, cell(QStringLiteral("%1 – %2").arg(fmt::mbps(result.clientMinMbps),
+                                                              fmt::mbps(result.clientMaxMbps))));
+    table->setItem(row, 6, cell(result.latencyMs < 0 ? QStringLiteral("–")
+                                                     : MainWindow::tr("%1 ms").arg(fmt::ms(result.latencyMs))));
+    table->setItem(row, 7, cell(fmt::bytes(result.bytes)));
+    if (result.retries > 0) {
+        for (int column = 0; column < table->columnCount(); ++column)
+            table->item(row, column)->setToolTip(
+                MainWindow::tr("%n Übertragung(en) abgebrochen und neu gestartet", nullptr, result.retries));
+    }
+}
+
+// Internet measurements only: the contract check makes no sense for LAN tests.
+QList<SpeedRun> internetRuns(const QList<SpeedRun> &runs)
+{
+    QList<SpeedRun> result;
+    for (const SpeedRun &run : runs) {
+        if (http::proxyFor(QUrl(run.server)).type() != QNetworkProxy::NoProxy)
+            result << run;
+    }
+    return result;
+}
+
 // "1, 2, 4, 8" -> {1, 2, 4, 8}; empty list on invalid input
 QList<int> parseStages(const QString &text)
 {
@@ -148,18 +218,32 @@ MainWindow::MainWindow(QWidget *parent)
     m_serverUrl->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     m_serverUrl->setToolTip(tr("Cloudflare für Messungen des Internetanschlusses oder die Adresse eines "
                                "Rechners, auf dem der LAN-Server läuft."));
+    m_ipVersion = new QComboBox;
+    m_ipVersion->addItem(tr("IPv4 + IPv6"), int(http::IpVersion::Any));
+    m_ipVersion->addItem(tr("nur IPv4"), int(http::IpVersion::V4));
+    m_ipVersion->addItem(tr("nur IPv6"), int(http::IpVersion::V6));
+    m_ipVersion->setToolTip(tr("Über IPv4 und IPv6 kann der Weg zum Server unterschiedlich schnell sein. "
+                               "Hinter einem Proxy lässt sich die Version nicht erzwingen."));
+
+    m_serverInfo = new QLabel;
+    m_serverInfo->setEnabled(false); // dimmed secondary text
+    m_serverInfo->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
     auto *serverRow = new QHBoxLayout;
     serverRow->addWidget(new QLabel(tr("Server:")));
     serverRow->addWidget(m_serverUrl, 1);
+    serverRow->addWidget(m_ipVersion);
 
     m_tabs = new QTabWidget;
     m_tabs->addTab(createSpeedTestTab(), tr("Speedtest"));
     m_tabs->addTab(createLoadTestTab(), tr("Bandbreite unter Last"));
+    m_tabs->addTab(createContractTab(), tr("Vertrag prüfen"));
     m_tabs->addTab(createServerTab(), tr("LAN-Server"));
 
     auto *central = new QWidget;
     auto *centralLayout = new QVBoxLayout(central);
     centralLayout->addLayout(serverRow);
+    centralLayout->addWidget(m_serverInfo);
     centralLayout->addWidget(m_tabs, 1);
     setCentralWidget(central);
 
@@ -169,6 +253,7 @@ MainWindow::MainWindow(QWidget *parent)
         m_pingTile.value->setText(fmt::ms(ping));
         m_pingTile.detail->setText(tr("ms · Jitter %1 ms").arg(fmt::ms(jitter)));
     });
+    connect(m_test, &SpeedTest::serverInfoChanged, this, &MainWindow::showServerInfo);
     connect(m_test, &SpeedTest::throughputSample, this, &MainWindow::onSample);
     connect(m_test, &SpeedTest::phaseFinished, this, &MainWindow::onPhaseFinished);
     connect(m_test, &SpeedTest::finished, this, &MainWindow::onFinished);
@@ -220,7 +305,10 @@ MainWindow::MainWindow(QWidget *parent)
     connect(&m_serverStatsTimer, &QTimer::timeout, this, &MainWindow::updateServerStatus);
 
     loadSettings();
+    m_historyPath = history::defaultPath();
+    loadHistory();
     updateContractLine();
+    updateContractCheck();
     updateServerStatus();
     updateRunningState();
     resize(860, 820);
@@ -301,10 +389,10 @@ QWidget *MainWindow::createSpeedTestTab()
     m_duration->setToolTip(tr("Messdauer je Richtung (Download und Upload)"));
 
     m_streams = new QSpinBox;
-    m_streams->setRange(1, 6);
+    m_streams->setRange(1, SpeedTest::kMaxStreams);
     m_streams->setValue(4);
     m_streams->setToolTip(tr("Anzahl paralleler Verbindungen. Mehrere Streams lasten schnelle "
-                             "Leitungen besser aus."));
+                             "Leitungen besser aus, ab etwa 1 Gbit/s z. B. 8 bis 16."));
 
     m_repeats = new QSpinBox;
     m_repeats->setRange(1, 100);
@@ -350,14 +438,15 @@ QWidget *MainWindow::createSpeedTestTab()
 
     // History of this session
     m_history = createTable({tr("Serie"), tr("Zeit"), tr("Server"), tr("Ping (ms)"), tr("Jitter (ms)"),
-                             tr("Download (Mbit/s)"), tr("Upload (Mbit/s)")});
+                             tr("Download (Mbit/s)"), tr("Upload (Mbit/s)"), tr("Ping unter Last ↓ / ↑")});
     m_history->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
-    m_history->setToolTip(tr("Rot markierte Werte weichen deutlich vom Rest ihrer Serie ab (Ausreißer)."));
+    m_history->setToolTip(tr("Rot markierte Werte weichen deutlich vom Rest ihrer Serie ab (Ausreißer). "
+                             "Der Verlauf bleibt zwischen den Starts erhalten."));
 
     m_clearButton = new QPushButton(tr("Verlauf leeren"));
     connect(m_clearButton, &QPushButton::clicked, this, &MainWindow::clearHistory);
     m_exportButton = new QPushButton(tr("Excel-Export …"));
-    m_exportButton->setToolTip(tr("Alle Messungen dieser Sitzung mit Auswertung als Excel-Datei (.xlsx) speichern"));
+    m_exportButton->setToolTip(tr("Alle Messungen des Verlaufs mit Auswertung als Excel-Datei (.xlsx) speichern"));
     connect(m_exportButton, &QPushButton::clicked, this, &MainWindow::exportReport);
 
     auto *historyRow = new QHBoxLayout;
@@ -488,6 +577,89 @@ QWidget *MainWindow::createLoadTestTab()
     return page;
 }
 
+QWidget *MainWindow::createContractTab()
+{
+    auto *page = new QWidget;
+
+    auto *intro = new QLabel(
+        tr("Vorprüfung nach den Kriterien der Bundesnetzagentur für eine Minderung (§ 57 TKG): 30 Messungen an "
+           "3 Kalendertagen, je Tag 10 Messungen mit mindestens 5 Minuten Abstand und 3 Stunden Pause nach der "
+           "5. Messung, mindestens ein Tag zwischen den Messtagen, alles innerhalb von 14 Tagen. Ausgewertet werden "
+           "die Speedtests gegen Internet-Server aus dem Verlauf. Rechtlich zählt nur die offizielle "
+           "<a href=\"https://breitbandmessung.de\">Breitbandmessung</a>; diese Prüfung zeigt, ob sie sich lohnt."));
+    intro->setWordWrap(true);
+    intro->setTextFormat(Qt::RichText);
+    intro->setOpenExternalLinks(true);
+
+    auto speedBox = [this](SpeedInputs &inputs) {
+        auto make = [this](const QString &tip) {
+            auto *box = new QSpinBox;
+            box->setRange(0, 100'000);
+            box->setSuffix(tr(" Mbit/s"));
+            box->setSpecialValueText(tr("–"));
+            box->setToolTip(tip);
+            connect(box, &QSpinBox::valueChanged, this, &MainWindow::updateContractCheck);
+            return box;
+        };
+        inputs.max = make(tr("Vertraglich vereinbarte maximale Geschwindigkeit"));
+        inputs.normal = make(tr("Normalerweise zur Verfügung stehende Geschwindigkeit"));
+        inputs.min = make(tr("Minimale Geschwindigkeit"));
+    };
+    speedBox(m_contractDown);
+    speedBox(m_contractUp);
+
+    auto *grid = new QGridLayout;
+    grid->addWidget(new QLabel(tr("Maximal")), 0, 1);
+    grid->addWidget(new QLabel(tr("Normal")), 0, 2);
+    grid->addWidget(new QLabel(tr("Minimal")), 0, 3);
+    grid->addWidget(new QLabel(tr("Download:")), 1, 0);
+    grid->addWidget(m_contractDown.max, 1, 1);
+    grid->addWidget(m_contractDown.normal, 1, 2);
+    grid->addWidget(m_contractDown.min, 1, 3);
+    grid->addWidget(new QLabel(tr("Upload:")), 2, 0);
+    grid->addWidget(m_contractUp.max, 2, 1);
+    grid->addWidget(m_contractUp.normal, 2, 2);
+    grid->addWidget(m_contractUp.min, 2, 3);
+    grid->setColumnStretch(4, 1);
+
+    auto *box = new QGroupBox(tr("Vertrag (siehe Produktinformationsblatt)"));
+    box->setLayout(grid);
+
+    m_blockButton = new QPushButton(tr("Messblock starten (5 × alle 5 min)"));
+    m_blockButton->setToolTip(tr("Startet im Speedtest-Tab 5 Messungen mit 5 Minuten Pause. Zwei solche Blöcke "
+                                 "im Abstand von mindestens 3 Stunden ergeben einen Messtag."));
+    connect(m_blockButton, &QPushButton::clicked, this, &MainWindow::startMeasurementBlock);
+
+    auto *hint = new QLabel(
+        tr("Ohne offenes Fenster geht es mit einem cron-Job, z. B. um 9, 9:10, … und ab 18 Uhr:<br>"
+           "<code>0,10,20,30,40 9,18 * * * broadband --run --format csv --no-header &gt;&gt; ~/speed.csv</code>"));
+    hint->setWordWrap(true);
+    hint->setTextFormat(Qt::RichText);
+    hint->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    m_contractDays = createTable({tr("Messtag"), tr("Messungen"), tr("Download (Mbit/s)"), tr("Upload (Mbit/s)"),
+                                  tr("Protokoll")});
+    m_contractDays->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
+
+    m_contractSummary = new QLabel;
+    m_contractSummary->setWordWrap(true);
+    m_contractSummary->setTextFormat(Qt::RichText);
+    m_contractSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    auto *buttons = new QHBoxLayout;
+    buttons->addWidget(m_blockButton);
+    buttons->addStretch();
+
+    auto *layout = new QVBoxLayout(page);
+    layout->addWidget(intro);
+    layout->addWidget(box);
+    layout->addLayout(buttons);
+    layout->addWidget(hint);
+    layout->addWidget(m_contractDays, 1);
+    layout->addWidget(m_contractSummary);
+    return page;
+}
+
 QWidget *MainWindow::createServerTab()
 {
     auto *page = new QWidget;
@@ -558,6 +730,14 @@ void MainWindow::loadSettings()
     m_loadRuns->setValue(settings.value(QStringLiteral("load/runs"), m_loadRuns->value()).toInt());
     m_loadPause->setValue(settings.value(QStringLiteral("load/pause"), m_loadPause->value()).toInt());
     m_port->setValue(settings.value(QStringLiteral("server/port"), m_port->value()).toInt());
+    m_ipVersion->setCurrentIndex(
+        std::max(0, m_ipVersion->findData(settings.value(QStringLiteral("test/ipVersion"), 0).toInt())));
+    for (const auto &[inputs, prefix] : {std::pair{&m_contractDown, QStringLiteral("contract/down")},
+                                         std::pair{&m_contractUp, QStringLiteral("contract/up")}}) {
+        inputs->max->setValue(settings.value(prefix + QStringLiteral("Max"), 0).toInt());
+        inputs->normal->setValue(settings.value(prefix + QStringLiteral("Normal"), 0).toInt());
+        inputs->min->setValue(settings.value(prefix + QStringLiteral("Min"), 0).toInt());
+    }
 }
 
 void MainWindow::saveSettings() const
@@ -575,6 +755,13 @@ void MainWindow::saveSettings() const
     settings.setValue(QStringLiteral("load/runs"), m_loadRuns->value());
     settings.setValue(QStringLiteral("load/pause"), m_loadPause->value());
     settings.setValue(QStringLiteral("server/port"), m_port->value());
+    settings.setValue(QStringLiteral("test/ipVersion"), m_ipVersion->currentData().toInt());
+    for (const auto &[inputs, prefix] : {std::pair{&m_contractDown, QStringLiteral("contract/down")},
+                                         std::pair{&m_contractUp, QStringLiteral("contract/up")}}) {
+        settings.setValue(prefix + QStringLiteral("Max"), inputs->max->value());
+        settings.setValue(prefix + QStringLiteral("Normal"), inputs->normal->value());
+        settings.setValue(prefix + QStringLiteral("Min"), inputs->min->value());
+    }
 }
 
 // --- Shared -----------------------------------------------------------------
@@ -588,6 +775,83 @@ bool MainWindow::serverUrl(QUrl &url)
         return false;
     }
     return true;
+}
+
+http::IpVersion MainWindow::ipVersion() const
+{
+    return http::IpVersion(m_ipVersion->currentData().toInt());
+}
+
+void MainWindow::showServerInfo(const http::ServerInfo &info)
+{
+    QStringList parts;
+    if (!info.colo.isEmpty())
+        parts << tr("Rechenzentrum %1").arg(info.colo);
+    if (info.ipVersion())
+        parts << tr("verbunden über IPv%1").arg(info.ipVersion());
+    if (!info.clientIp.isEmpty())
+        parts << tr("deine IP %1").arg(info.clientIp);
+    if (!info.asn.isEmpty())
+        parts << tr("AS%1").arg(info.asn);
+    m_serverInfo->setText(parts.join(QStringLiteral(" · ")));
+}
+
+void MainWindow::loadHistory()
+{
+    QString error;
+    const history::Data data = history::load(m_historyPath, &error);
+    if (!error.isEmpty())
+        m_status->setText(tr("Verlauf konnte nicht gelesen werden: %1").arg(error));
+
+    m_speedRuns = data.speedRuns;
+    m_series = data.lastSpeedSeries();
+    for (const SpeedRun &run : std::as_const(m_speedRuns))
+        addHistoryRow(run);
+    updateSeriesAnalysis();
+
+    m_lastLoadSeries = data.lastLoadSeries();
+    if (!data.loadSeries.isEmpty()) {
+        m_loadSeries = data.loadSeries.last();
+        showLoadResults();
+    }
+}
+
+void MainWindow::addHistoryRow(const SpeedRun &run)
+{
+    const SpeedTestResult &result = run.result;
+    m_history->insertRow(0);
+    m_history->setItem(0, 0, cell(QStringLiteral("%1.%2").arg(run.series).arg(run.index), Qt::AlignCenter));
+    auto *time = cell(timeText(run.time), Qt::AlignLeft | Qt::AlignVCenter);
+    time->setToolTip(QLocale().toString(run.time, QLocale::LongFormat));
+    m_history->setItem(0, 1, time);
+    m_history->setItem(0, 2, cell(serverText(run), Qt::AlignLeft | Qt::AlignVCenter));
+    m_history->setItem(0, 3, cell(fmt::ms(result.pingMs)));
+    m_history->setItem(0, 4, cell(fmt::ms(result.jitterMs)));
+    m_history->setItem(0, 5, cell(fmt::mbps(result.downloadMbps)));
+    m_history->setItem(0, 6, cell(fmt::mbps(result.uploadMbps)));
+    m_history->setItem(0, 7, cell(loadedLatencyText(result)));
+}
+
+void MainWindow::showLoadResults()
+{
+    m_loadTable->setRowCount(0);
+    for (qsizetype i = 0; i < m_loadSeries.runs.size(); ++i) {
+        for (const LoadStageResult &stage : m_loadSeries.runs[i].stages)
+            addLoadRow(m_loadTable, int(i + 1), stage, m_loadSeries.contractMbps);
+    }
+    QString summary = findingsHtml(report::loadFindings(m_loadSeries));
+    if (!m_loadSeries.runs.isEmpty()) {
+        summary = tr("<b>Letzter Lasttest vom %1</b><br>")
+                      .arg(QLocale().toString(m_loadSeries.runs.first().time, QLocale::ShortFormat)) +
+                  summary;
+    }
+    m_loadSummary->setText(summary);
+}
+
+void MainWindow::saveHistoryError(const QString &error)
+{
+    QMessageBox::warning(this, windowTitle(), tr("Die Messung konnte nicht im Verlauf gespeichert werden: %1\n%2")
+                                                  .arg(error, QDir::toNativeSeparators(m_historyPath)));
 }
 
 void MainWindow::updateRunningState()
@@ -615,6 +879,8 @@ void MainWindow::updateRunningState()
     m_loadExportButton->setEnabled(canExport);
 
     m_serverUrl->setEnabled(!speedRunning && !loadRunning);
+    m_ipVersion->setEnabled(!speedRunning && !loadRunning);
+    m_blockButton->setEnabled(!speedRunning && !loadRunning);
 }
 
 void MainWindow::startPause(int seconds, QLabel *status, std::function<void()> next)
@@ -692,6 +958,8 @@ void MainWindow::toggleTest()
     m_speedConfig.baseUrl = url;
     m_speedConfig.durationSec = m_duration->value();
     m_speedConfig.streams = m_streams->value();
+    m_speedConfig.ipVersion = ipVersion();
+    m_serverInfo->clear();
 
     ++m_series;
     m_seriesRun = 0;
@@ -763,9 +1031,15 @@ void MainWindow::onPhaseFinished(SpeedTest::Phase phase, double mbps)
 {
     const bool download = phase == SpeedTest::Phase::Download;
     const qint64 bytes = download ? m_test->result().downloadedBytes : m_test->result().uploadedBytes;
+    const double latency = download ? m_test->result().downloadLatencyMs : m_test->result().uploadLatencyMs;
     Tile &tile = download ? m_downloadTile : m_uploadTile;
     tile.value->setText(fmt::mbps(mbps));
-    tile.detail->setText(tr("Mbit/s · %1 übertragen").arg(fmt::bytes(bytes)));
+    QString detail = tr("Mbit/s · %1 übertragen").arg(fmt::bytes(bytes));
+    if (latency >= 0)
+        detail += tr(" · Ping %1 ms").arg(fmt::ms(latency));
+    tile.detail->setText(detail);
+    tile.detail->setToolTip(tr("Ping während %1: steigt er stark an, puffert der Router zu viel (Bufferbloat).")
+                                .arg(download ? tr("des Downloads") : tr("des Uploads")));
 }
 
 void MainWindow::onFinished(const SpeedTestResult &result)
@@ -777,21 +1051,21 @@ void MainWindow::onFinished(const SpeedTestResult &result)
     run.index = m_seriesRun;
     run.streams = m_speedConfig.streams;
     run.durationSec = m_speedConfig.durationSec;
+    run.ipVersion = result.server.ipVersion();
     run.result = result;
     m_speedRuns.append(run);
-
-    m_history->insertRow(0);
-    m_history->setItem(0, 0, cell(QStringLiteral("%1.%2").arg(run.series).arg(run.index), Qt::AlignCenter));
-    m_history->setItem(0, 1, cell(run.time.toString(QStringLiteral("HH:mm:ss")), Qt::AlignLeft | Qt::AlignVCenter));
-    m_history->setItem(0, 2, cell(run.server, Qt::AlignLeft | Qt::AlignVCenter));
-    m_history->setItem(0, 3, cell(fmt::ms(result.pingMs)));
-    m_history->setItem(0, 4, cell(fmt::ms(result.jitterMs)));
-    m_history->setItem(0, 5, cell(fmt::mbps(result.downloadMbps)));
-    m_history->setItem(0, 6, cell(fmt::mbps(result.uploadMbps)));
+    addHistoryRow(run);
     updateSeriesAnalysis();
+    updateContractCheck();
 
-    const QString text = tr("Fertig: %1 Mbit/s down, %2 Mbit/s up, %3 ms Ping")
-                             .arg(fmt::mbps(result.downloadMbps), fmt::mbps(result.uploadMbps), fmt::ms(result.pingMs));
+    QString error;
+    if (!history::append(m_historyPath, run, &error))
+        saveHistoryError(error);
+
+    QString text = tr("Fertig: %1 Mbit/s down, %2 Mbit/s up, %3 ms Ping")
+                       .arg(fmt::mbps(result.downloadMbps), fmt::mbps(result.uploadMbps), fmt::ms(result.pingMs));
+    if (result.retries > 0)
+        text += tr(" · %n Verbindung(en) neu aufgebaut", nullptr, result.retries);
     m_status->setText(seriesPrefix() + text);
 
     if (m_speedSeriesActive && m_seriesRun < m_seriesTotal) {
@@ -867,21 +1141,34 @@ void MainWindow::updateSeriesAnalysis()
     }
 
     const QList<SpeedRun> series = currentSeries();
-    if (series.size() < 2) {
+    const QList<Finding> loaded = report::loadedLatencyFindings(series);
+    if (series.size() < 2 && loaded.isEmpty()) {
         m_seriesAnalysis->clear();
         m_seriesAnalysis->hide();
         return;
     }
-    m_seriesAnalysis->setText(tr("<b>Auswertung Serie %1</b><br>").arg(m_series) +
-                              findingsHtml(report::speedFindings(series)));
+    const QList<Finding> findings = series.size() < 2 ? loaded : report::speedFindings(series) + loaded;
+    m_seriesAnalysis->setText(tr("<b>Auswertung Serie %1</b><br>").arg(m_series) + findingsHtml(findings));
     m_seriesAnalysis->show();
 }
 
 void MainWindow::clearHistory()
 {
+    const auto answer = QMessageBox::question(
+        this, windowTitle(),
+        tr("Alle %n gespeicherten Speedtests endgültig löschen? Die Lasttests bleiben erhalten.", nullptr,
+           int(m_speedRuns.size())));
+    if (answer != QMessageBox::Yes)
+        return;
+    QString error;
+    if (!history::removeSpeedRuns(m_historyPath, &error)) {
+        QMessageBox::warning(this, windowTitle(), tr("Verlauf konnte nicht gelöscht werden: %1").arg(error));
+        return;
+    }
     m_speedRuns.clear();
     m_history->setRowCount(0);
     updateSeriesAnalysis();
+    updateContractCheck();
     updateRunningState();
 }
 
@@ -917,8 +1204,10 @@ void MainWindow::toggleLoadTest()
     m_loadConfig.stages = stages;
     m_loadConfig.stageDurationSec = m_loadDuration->value();
     m_loadConfig.upload = m_loadDirection->currentIndex() == 1;
+    m_loadConfig.ipVersion = ipVersion();
 
     m_loadSeries = LoadSeries();
+    m_loadSeries.id = ++m_lastLoadSeries;
     m_loadSeries.server = url.toString();
     m_loadSeries.upload = m_loadConfig.upload;
     m_loadSeries.contractMbps = m_contract->value();
@@ -955,29 +1244,7 @@ void MainWindow::updateContractLine()
 
 void MainWindow::onLoadStageFinished(int, const LoadStageResult &result)
 {
-    const int row = m_loadTable->rowCount();
-    m_loadTable->insertRow(row);
-    m_loadTable->setItem(row, 0, cell(QString::number(m_loadRun), Qt::AlignCenter));
-    m_loadTable->setItem(row, 1, cell(QString::number(result.clients)));
-    m_loadTable->setItem(row, 2, cell(fmt::mbps(result.totalMbps)));
-
-    auto *contractCell = cell(QStringLiteral("–"));
-    if (m_loadSeries.contractMbps > 0) {
-        const double fraction = result.totalMbps / m_loadSeries.contractMbps;
-        contractCell->setText(QStringLiteral("%1 %").arg(qRound(fraction * 100)));
-        contractCell->setForeground(ratingColor(fraction));
-        QFont font = contractCell->font();
-        font.setBold(true);
-        contractCell->setFont(font);
-    }
-    m_loadTable->setItem(row, 3, contractCell);
-
-    m_loadTable->setItem(row, 4, cell(fmt::mbps(result.clientAvgMbps)));
-    m_loadTable->setItem(row, 5, cell(QStringLiteral("%1 – %2").arg(fmt::mbps(result.clientMinMbps),
-                                                                    fmt::mbps(result.clientMaxMbps))));
-    m_loadTable->setItem(row, 6, cell(result.latencyMs < 0 ? QStringLiteral("–")
-                                                           : tr("%1 ms").arg(fmt::ms(result.latencyMs))));
-    m_loadTable->setItem(row, 7, cell(fmt::bytes(result.bytes)));
+    addLoadRow(m_loadTable, m_loadRun, result, m_loadSeries.contractMbps);
     m_loadTable->scrollToBottom();
 }
 
@@ -988,6 +1255,10 @@ void MainWindow::onLoadFinished()
     run.idleLatencyMs = m_load->idleLatencyMs();
     run.stages = m_load->results();
     m_loadSeries.runs.append(run);
+
+    QString error;
+    if (!history::append(m_historyPath, m_loadSeries, run, &error))
+        saveHistoryError(error);
 
     QString summary = findingsHtml(report::loadFindings(m_loadSeries));
     if (m_loadRunTotal > 1) {
@@ -1002,6 +1273,84 @@ void MainWindow::onLoadFinished()
         m_loadStatus->setText(tr("Fertig"));
     }
     updateRunningState();
+}
+
+// --- Contract check ---------------------------------------------------------
+
+contract::Contract MainWindow::currentContract() const
+{
+    contract::Contract c;
+    for (const auto &[speeds, inputs] : {std::pair{&c.download, &m_contractDown}, std::pair{&c.upload, &m_contractUp}}) {
+        speeds->maxMbps = inputs->max->value();
+        speeds->normalMbps = inputs->normal->value();
+        speeds->minMbps = inputs->min->value();
+    }
+    return c;
+}
+
+void MainWindow::updateContractCheck()
+{
+    if (!m_contractDays)
+        return;
+    const contract::Contract c = currentContract();
+    const contract::Result result = contract::evaluate(internetRuns(m_speedRuns), c);
+
+    auto range = [](const QList<SpeedRun> &runs, report::Metric metric) {
+        const stats::Summary s = stats::summarize(report::metricValues(runs, metric));
+        return s.count ? QStringLiteral("%1 – %2").arg(fmt::mbps(s.min), fmt::mbps(s.max)) : QStringLiteral("–");
+    };
+    // Red if the minimum was undercut that day, green if 90 % of the maximum was reached.
+    auto rated = [](QTableWidgetItem *item, const contract::Speeds &speeds, const QList<double> &values) {
+        if (speeds.minMbps > 0 && std::any_of(values.begin(), values.end(), [&](double v) { return v < speeds.minMbps; }))
+            item->setForeground(kBadColor);
+        else if (speeds.maxMbps > 0 &&
+                 std::any_of(values.begin(), values.end(), [&](double v) { return v >= speeds.maxMbps * kContractThreshold; }))
+            item->setForeground(kGoodColor);
+        return item;
+    };
+
+    m_contractDays->setRowCount(0);
+    for (const contract::Day &day : result.days) {
+        const int row = m_contractDays->rowCount();
+        m_contractDays->insertRow(row);
+        m_contractDays->setItem(row, 0, cell(QLocale().toString(day.date, QStringLiteral("ddd dd.MM.yyyy")),
+                                             Qt::AlignLeft | Qt::AlignVCenter));
+        m_contractDays->setItem(row, 1, cell(QStringLiteral("%1 / %2").arg(day.runs.size()).arg(contract::kPerDay)));
+        m_contractDays->setItem(row, 2, rated(cell(range(day.runs, report::Metric::Download)), c.download,
+                                              report::metricValues(day.runs, report::Metric::Download)));
+        m_contractDays->setItem(row, 3, rated(cell(range(day.runs, report::Metric::Upload)), c.upload,
+                                              report::metricValues(day.runs, report::Metric::Upload)));
+        auto *protocol = cell(day.protocolIssues.isEmpty() ? tr("✔ passt") : day.protocolIssues.join(QStringLiteral("; ")),
+                              Qt::AlignLeft | Qt::AlignVCenter);
+        protocol->setForeground(day.protocolIssues.isEmpty() ? kGoodColor : kWarnColor);
+        m_contractDays->setItem(row, 4, protocol);
+    }
+
+    QList<Finding> findings = result.findings;
+    for (const QString &issue : result.protocolIssues)
+        findings.insert(1, Finding{Finding::Warning, issue});
+    if (result.days.isEmpty()) {
+        findings = {Finding{Finding::Info, tr("Noch keine Speedtests gegen einen Internet-Server im Verlauf.")}};
+    }
+    m_contractSummary->setText(findingsHtml(findings));
+}
+
+void MainWindow::startMeasurementBlock()
+{
+    QUrl url;
+    if (!serverUrl(url))
+        return;
+    if (http::proxyFor(url).type() == QNetworkProxy::NoProxy) {
+        QMessageBox::information(this, windowTitle(),
+                                 tr("Für die Vertragsprüfung bitte einen Internet-Server wie %1 eintragen, "
+                                    "keinen Rechner im LAN.")
+                                     .arg(kDefaultServer));
+        return;
+    }
+    m_repeats->setValue(5);
+    m_pause->setValue(contract::kMinSpacingMin * 60);
+    m_tabs->setCurrentIndex(0);
+    toggleTest();
 }
 
 // --- LAN server -------------------------------------------------------------

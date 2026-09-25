@@ -40,6 +40,17 @@ QString formatMetric(double value, report::Metric metric)
     return metric == report::Metric::Download || metric == report::Metric::Upload ? fmt::mbps(value) : fmt::ms(value);
 }
 
+// "https://speed.cloudflare.com · FRA · IPv4"
+QString serverLabel(const SpeedRun &run)
+{
+    QStringList parts{run.server};
+    if (!run.result.server.colo.isEmpty())
+        parts << run.result.server.colo;
+    if (run.ipVersion)
+        parts << QStringLiteral("IPv%1").arg(run.ipVersion);
+    return parts.join(QStringLiteral(" · "));
+}
+
 QString runLabel(const SpeedRun &run, int position)
 {
     return tr("Messung %1 (%2)").arg(position).arg(run.time.toString(QStringLiteral("HH:mm:ss")));
@@ -75,6 +86,9 @@ const QList<Color> kRunColors{kAccent,
                                Color(0x0e9fb5),
                                Color(0x8d6e63),
                                kJitter};
+
+// More extra latency under load than this is clearly noticeable.
+constexpr double kBufferbloatMs = 100.0;
 
 const QString kMbpsFormat = QStringLiteral("0.0");
 const QString kMsFormat = QStringLiteral("0.0");
@@ -392,7 +406,7 @@ int writeSpeedOverview(XlsxWriter::Sheet &sheet, int row, const QList<SpeedRun> 
     }
 
     ++row;
-    for (const Finding &finding : report::speedFindings(runs))
+    for (const Finding &finding : report::speedFindings(runs) + report::loadedLatencyFindings(runs))
         writeFinding(sheet, row++, last, overviewWidth(), finding);
     return row;
 }
@@ -531,8 +545,9 @@ void writeSpeedSheet(XlsxWriter::Sheet &sheet, const QList<SpeedRun> &runs)
     const QStringList headers{tr("Nr."),          tr("Serie"),           tr("Zeitpunkt"),         tr("Server"),
                               tr("Streams"),      tr("Dauer (s)"),       tr("Ping (ms)"),         tr("Jitter (ms)"),
                               tr("Download (Mbit/s)"), tr("Upload (Mbit/s)"), tr("Download Δ Median"),
-                              tr("Upload Δ Median"), tr("Daten ↓ (MB)"),  tr("Daten ↑ (MB)"),     tr("Hinweis")};
-    const double widths[] = {6, 8, 19, 30, 9, 9, 11, 11, 13, 13, 13, 13, 12, 12, 34};
+                              tr("Upload Δ Median"), tr("Daten ↓ (MB)"),  tr("Daten ↑ (MB)"),
+                              tr("Ping Last ↓ (ms)"), tr("Ping Last ↑ (ms)"), tr("Neu verbunden"), tr("Hinweis")};
+    const double widths[] = {6, 8, 19, 30, 9, 9, 11, 11, 13, 13, 13, 13, 12, 12, 13, 13, 11, 34};
     for (int c = 0; c < headers.size(); ++c)
         sheet.setColumnWidth(c, widths[c]);
     writeHeader(sheet, 0, headers);
@@ -560,7 +575,7 @@ void writeSpeedSheet(XlsxWriter::Sheet &sheet, const QList<SpeedRun> &runs)
         sheet.setText(row, 1, QStringLiteral("%1.%2").arg(run.series).arg(run.index),
                       cellStyle(zebra, {}, Style::Center));
         sheet.setDateTime(row, 2, run.time, cellStyle(zebra, kDateTimeFormat, Style::Left));
-        sheet.setText(row, 3, run.server, cellStyle(zebra, {}, Style::Left));
+        sheet.setText(row, 3, serverLabel(run), cellStyle(zebra, {}, Style::Left));
         sheet.setNumber(row, 4, run.streams, cellStyle(zebra, QStringLiteral("0")));
         sheet.setNumber(row, 5, run.durationSec, cellStyle(zebra, QStringLiteral("0")));
 
@@ -589,7 +604,17 @@ void writeSpeedSheet(XlsxWriter::Sheet &sheet, const QList<SpeedRun> &runs)
         }
         sheet.setNumber(row, 12, double(run.result.downloadedBytes) / 1e6, cellStyle(zebra, kMbFormat));
         sheet.setNumber(row, 13, double(run.result.uploadedBytes) / 1e6, cellStyle(zebra, kMbFormat));
-        sheet.setText(row, 14, notes.isEmpty() ? QString() : tr("Ausreißer: %1").arg(notes.join(QStringLiteral(", "))),
+        for (const auto &[column, latency] : {std::pair{14, run.result.downloadLatencyMs},
+                                              std::pair{15, run.result.uploadLatencyMs}}) {
+            if (latency >= 0)
+                sheet.setNumber(row, column, latency, cellStyle(zebra, kMsFormat));
+            else
+                sheet.setText(row, column, QStringLiteral("–"), cellStyle(zebra));
+        }
+        sheet.setNumber(row, 16, run.result.retries,
+                        run.result.retries > 0 ? rated(cellStyle(zebra, QStringLiteral("0")), Finding::Warning)
+                                               : cellStyle(zebra, QStringLiteral("0")));
+        sheet.setText(row, 17, notes.isEmpty() ? QString() : tr("Ausreißer: %1").arg(notes.join(QStringLiteral(", "))),
                       notes.isEmpty() ? cellStyle(zebra, {}, Style::Left)
                                       : rated(cellStyle(zebra, {}, Style::Left), Finding::Bad));
     }
@@ -994,6 +1019,49 @@ QList<Finding> report::speedFindings(const QList<SpeedRun> &runs)
     return findings;
 }
 
+QList<Finding> report::loadedLatencyFindings(const QList<SpeedRun> &runs)
+{
+    QList<double> down, up;
+    int retries = 0;
+    for (const SpeedRun &run : runs) {
+        if (run.result.downloadLatencyMs >= 0)
+            down << run.result.downloadLatencyMs;
+        if (run.result.uploadLatencyMs >= 0)
+            up << run.result.uploadLatencyMs;
+        retries += run.result.retries;
+    }
+
+    QList<Finding> findings;
+    if (!down.isEmpty() || !up.isEmpty()) {
+        const double idle = stats::median(metricValues(runs, Metric::Ping));
+        const double loadedDown = down.isEmpty() ? -1.0 : stats::median(down);
+        const double loadedUp = up.isEmpty() ? -1.0 : stats::median(up);
+        const double worst = std::max(loadedDown, loadedUp);
+        QStringList parts;
+        if (loadedDown >= 0)
+            parts << tr("%1 ms beim Download").arg(fmt::ms(loadedDown));
+        if (loadedUp >= 0)
+            parts << tr("%1 ms beim Upload").arg(fmt::ms(loadedUp));
+        const QString text = tr("Ping unter Last: %1 (ohne Last %2 ms).")
+                                 .arg(parts.join(QStringLiteral(", ")), fmt::ms(idle));
+        if (worst - idle > kBufferbloatMs) {
+            findings << Finding{Finding::Warning, text + tr(" Das ist deutlich spürbar, z. B. bei Videocalls oder "
+                                                            "Spielen, während jemand lädt (Bufferbloat). Abhilfe "
+                                                            "schafft oft SQM/Smart Queue im Router.")};
+        } else {
+            findings << Finding{Finding::Good, text + tr(" Der Router puffert kaum, die Leitung bleibt auch bei "
+                                                         "voller Auslastung reaktionsschnell.")};
+        }
+    }
+    if (retries > 0) {
+        findings << Finding{Finding::Warning,
+                            tr("%n Übertragung(en) brachen ab und wurden neu gestartet. Gelegentlich ist das "
+                               "normal; häufen sich die Abbrüche, deutet das auf eine instabile Verbindung hin.",
+                               retries)};
+    }
+    return findings;
+}
+
 QList<Finding> report::loadFindings(const LoadSeries &series)
 {
     QList<Finding> findings;
@@ -1069,7 +1137,7 @@ QList<Finding> report::loadFindings(const LoadSeries &series)
     if (maxLatency >= 0.0) {
         const double idle = series.medianIdleLatencyMs();
         const QString text = tr("Ping steigt unter Last von %1 ms auf bis zu %2 ms.").arg(fmt::ms(idle), fmt::ms(maxLatency));
-        if (maxLatency - idle > 100.0) {
+        if (maxLatency - idle > kBufferbloatMs) {
             findings << Finding{Finding::Warning, text + tr(" Das ist deutlich spürbar, z. B. bei Videocalls oder "
                                                             "Spielen (Bufferbloat).")};
         } else {

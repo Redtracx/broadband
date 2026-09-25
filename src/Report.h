@@ -22,6 +22,7 @@ struct SpeedRun
     int index = 1;      // 1-based position within the series
     int streams = 0;
     int durationSec = 0;
+    int ipVersion = 0; // 4 or 6 as seen by the server, 0 if unknown
     SpeedTestResult result;
 };
 
@@ -36,6 +37,7 @@ struct LoadRun
 // Repeated load test runs with identical settings.
 struct LoadSeries
 {
+    int id = 0; // groups the runs in the stored history
     QString server;
     bool upload = false;
     int contractMbps = 0; // 0 = unknown
@@ -73,6 +75,9 @@ Finding::Level stabilityLevel(stats::Stability stability);
 // Is the series consistent, which runs are outliers, is there a trend?
 // All runs should be against the same server.
 QList<Finding> speedFindings(const QList<SpeedRun> &runs);
+
+// Bufferbloat (ping while downloading/uploading) and restarted transfers.
+QList<Finding> loadedLatencyFindings(const QList<SpeedRun> &runs);
 
 // Verdict of a load test: contract reached, saturation, bufferbloat and,
 // with several runs, how well they agree.

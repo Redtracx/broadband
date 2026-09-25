@@ -64,11 +64,22 @@ void LoadTest::start(const LoadTestConfig &config)
         return;
     }
 
-    m_pingNam->clearConnectionCache();
-    m_pingNam->setProxy(http::proxyFor(m_config.baseUrl));
-
     emit progressChanged(0.0);
-    sendPing();
+
+    const int runId = m_runId;
+    http::resolveTarget(m_config.baseUrl, m_config.ipVersion, this,
+                        [this, runId](const http::Target &target, const QString &error) {
+                            if (runId != m_runId || !m_running)
+                                return;
+                            if (!error.isEmpty()) {
+                                fail(error);
+                                return;
+                            }
+                            m_target = target;
+                            m_pingNam->clearConnectionCache();
+                            m_pingNam->setProxy(http::proxyFor(m_config.baseUrl));
+                            sendPing();
+                        });
 }
 
 void LoadTest::stop()
@@ -122,8 +133,7 @@ void LoadTest::teardownClients()
 
 void LoadTest::sendPing()
 {
-    const QUrl url = http::endpoint(m_config.baseUrl, QStringLiteral("__down"), 0);
-    m_pingReply = m_pingNam->get(http::makeRequest(url));
+    m_pingReply = m_pingNam->get(m_target.request(QStringLiteral("__down"), 0));
     m_pingTimer.start();
     connect(m_pingReply, &QNetworkReply::finished, this, [this] {
         const double elapsedMs = double(m_pingTimer.nsecsElapsed()) / 1e6;
@@ -179,6 +189,8 @@ void LoadTest::startStage(int index)
     m_stageOffset = double(index) * m_config.stageDurationSec;
     m_warmupMs = qint64(m_config.stageDurationSec * 1000 * kWarmupFraction);
     m_warmedUp = false;
+    ++m_stageSerial;
+    m_stageErrors = 0;
     m_stagePings.clear();
     m_window = {{0, 0}};
 
@@ -205,7 +217,7 @@ void LoadTest::launch(Client *client)
     QNetworkReply *reply = nullptr;
     if (m_config.upload) {
         client->uploadSent = 0;
-        reply = client->nam->post(http::makeUploadRequest(m_config.baseUrl), http::uploadPayload());
+        reply = client->nam->post(m_target.uploadRequest(), http::uploadPayload());
         connect(reply, &QNetworkReply::uploadProgress, this, [client](qint64 sent, qint64) {
             if (sent > client->uploadSent) {
                 client->bytes += sent - client->uploadSent;
@@ -213,8 +225,7 @@ void LoadTest::launch(Client *client)
             }
         });
     } else {
-        const QUrl url = http::endpoint(m_config.baseUrl, QStringLiteral("__down"), http::kDownloadChunk);
-        reply = client->nam->get(http::makeRequest(url));
+        reply = client->nam->get(m_target.request(QStringLiteral("__down"), http::kDownloadChunk));
         connect(reply, &QNetworkReply::readyRead, this, [client, reply] {
             client->bytes += reply->readAll().size();
         });
@@ -225,12 +236,29 @@ void LoadTest::launch(Client *client)
         client->reply = nullptr;
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
-            fail(tr("Übertragung fehlgeschlagen (%1 gleichzeitige Clients): %2")
-                     .arg(m_config.stages.value(m_stageIndex))
-                     .arg(reply->errorString()));
+            onTransferError(client, reply);
             return;
         }
         launch(client);
+    });
+}
+
+void LoadTest::onTransferError(Client *client, QNetworkReply *reply)
+{
+    // With many clients a dropped connection now and then is normal; only a
+    // server that rejects the request or keeps failing ends the test.
+    const int clients = int(m_clients.size());
+    if (http::isClientError(reply) || ++m_stageErrors > std::max(3, 2 * clients)) {
+        fail(tr("Übertragung fehlgeschlagen (%1 gleichzeitige Clients): %2").arg(clients).arg(reply->errorString()));
+        return;
+    }
+
+    ++client->retries;
+    const int serial = m_stageSerial;
+    QTimer::singleShot(http::kRetryDelayMs, this, [this, client, serial] {
+        // The client is gone once its stage is over.
+        if (serial == m_stageSerial && m_stageActive)
+            launch(client);
     });
 }
 
@@ -269,6 +297,7 @@ void LoadTest::finishStage()
 {
     m_sampleTimer.stop();
     m_stageActive = false;
+    ++m_stageSerial;
     const qint64 now = m_stageTimer.elapsed();
     const qint64 measuredMs = std::max<qint64>(1, now - m_warmupMs);
 
@@ -282,6 +311,7 @@ void LoadTest::finishStage()
         result.clientMaxMbps = std::max(result.clientMaxMbps, mbps);
         result.clientMinMbps = result.clientMinMbps < 0.0 ? mbps : std::min(result.clientMinMbps, mbps);
         result.bytes += client->bytes;
+        result.retries += client->retries;
     }
     result.clientMinMbps = std::max(0.0, result.clientMinMbps);
     result.clientAvgMbps = result.clients > 0 ? result.totalMbps / result.clients : 0.0;

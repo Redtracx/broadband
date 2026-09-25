@@ -1,5 +1,7 @@
 #pragma once
 
+#include "HttpCommon.h"
+
 #include <QElapsedTimer>
 #include <QList>
 #include <QObject>
@@ -16,6 +18,7 @@ struct LoadTestConfig
     QList<int> stages{1, 2, 4, 8, 16}; // simultaneous clients per stage
     int stageDurationSec = 10;
     bool upload = false;
+    http::IpVersion ipVersion = http::IpVersion::Any;
 };
 
 struct LoadStageResult
@@ -28,6 +31,7 @@ struct LoadStageResult
     double latencyMs = -1.0;    // median ping while loaded, -1 if no ping completed
     qint64 bytes = 0;           // transferred during the whole stage
     double seconds = 0.0;
+    int retries = 0;            // failed transfers that were restarted
 };
 
 // Bandwidth under concurrent load: runs one stage per entry in
@@ -72,6 +76,7 @@ private:
         qint64 bytes = 0;
         qint64 warmupBytes = 0;
         qint64 uploadSent = 0; // progress of the current upload request
+        int retries = 0;
     };
 
     void fail(const QString &message);
@@ -83,11 +88,15 @@ private:
 
     void startStage(int index);
     void launch(Client *client);
+    void onTransferError(Client *client, QNetworkReply *reply);
     void onSampleTimer();
     void finishStage();
 
     LoadTestConfig m_config;
-    int m_runId = 0; // invalidates pending timers of a previous run
+    http::Target m_target;
+    int m_runId = 0;       // invalidates pending timers of a previous run
+    int m_stageSerial = 0; // invalidates pending retries of a previous stage
+    int m_stageErrors = 0;
     bool m_running = false;
     bool m_idlePhase = false;
     bool m_stageActive = false;

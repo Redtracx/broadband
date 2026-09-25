@@ -1,6 +1,10 @@
 #include "HttpCommon.h"
 
 #include <QHostAddress>
+#include <QHostInfo>
+#include <QNetworkProxyFactory>
+#include <QNetworkReply>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QUrlQuery>
 
@@ -32,7 +36,33 @@ bool isLocalHost(const QString &host)
     return (address.toIPv6Address()[0] & 0xfe) == 0xfc; // fc00::/7
 }
 
+QNetworkRequest targetRequest(const Target &target, const QUrl &url)
+{
+    QNetworkRequest request = makeRequest(url);
+    if (!target.hostName.isEmpty()) {
+        const int port = target.url.port();
+        const bool defaultPort = port < 0 || port == (target.url.scheme() == QLatin1String("https") ? 443 : 80);
+        const QString host = defaultPort ? target.hostName : QStringLiteral("%1:%2").arg(target.hostName).arg(port);
+        request.setRawHeader("Host", host.toUtf8());
+        request.setPeerVerifyName(target.hostName);
+    }
+    return request;
+}
+
 } // namespace
+
+QString ipVersionName(IpVersion version)
+{
+    switch (version) {
+    case IpVersion::V4:
+        return QStringLiteral("IPv4");
+    case IpVersion::V6:
+        return QStringLiteral("IPv6");
+    case IpVersion::Any:
+        break;
+    }
+    return QStringLiteral("auto");
+}
 
 QUrl endpoint(const QUrl &base, const QString &name, qint64 bytes)
 {
@@ -66,11 +96,59 @@ QNetworkRequest makeRequest(const QUrl &url)
     return request;
 }
 
-QNetworkRequest makeUploadRequest(const QUrl &base)
+QNetworkRequest Target::request(const QString &name, qint64 bytes) const
 {
-    QNetworkRequest request = makeRequest(endpoint(base, QStringLiteral("__up")));
+    return targetRequest(*this, endpoint(url, name, bytes));
+}
+
+QNetworkRequest Target::uploadRequest() const
+{
+    QNetworkRequest request = targetRequest(*this, endpoint(url, QStringLiteral("__up")));
     request.setHeader(QNetworkRequest::ContentTypeHeader, QByteArray("application/octet-stream"));
     return request;
+}
+
+void resolveTarget(const QUrl &base, IpVersion version, QObject *context,
+                   std::function<void(const Target &target, const QString &error)> done)
+{
+    const QString host = base.host();
+    if (version == IpVersion::Any || QHostAddress(host).protocol() != QAbstractSocket::UnknownNetworkLayerProtocol) {
+        done(Target{base, {}}, {});
+        return;
+    }
+
+    // Through a proxy the proxy picks the address; forcing one would at best
+    // be ignored and is often refused.
+    if (proxyFor(base).type() != QNetworkProxy::NoProxy) {
+        const QList<QNetworkProxy> proxies = QNetworkProxyFactory::proxyForQuery(QNetworkProxyQuery(base));
+        if (!proxies.isEmpty() && proxies.first().type() != QNetworkProxy::NoProxy) {
+            done({}, QObject::tr("Die IP-Version lässt sich nicht erzwingen, weil die Verbindung über einen Proxy "
+                                 "läuft (%1:%2).")
+                         .arg(proxies.first().hostName())
+                         .arg(proxies.first().port()));
+            return;
+        }
+    }
+
+    const QPointer<QObject> guard(context);
+    QHostInfo::lookupHost(host, context, [base, version, host, guard, done](const QHostInfo &info) {
+        if (!guard)
+            return;
+        const auto wanted = version == IpVersion::V4 ? QAbstractSocket::IPv4Protocol : QAbstractSocket::IPv6Protocol;
+        const QList<QHostAddress> addresses = info.addresses();
+        const auto it = std::find_if(addresses.begin(), addresses.end(),
+                                     [wanted](const QHostAddress &a) { return a.protocol() == wanted; });
+        if (it == addresses.end()) {
+            const QString reason = info.error() != QHostInfo::NoError
+                                       ? info.errorString()
+                                       : QObject::tr("keine %1-Adresse gefunden").arg(ipVersionName(version));
+            done({}, QObject::tr("%1 nicht auflösbar: %2").arg(host, reason));
+            return;
+        }
+        QUrl url = base;
+        url.setHost(it->toString());
+        done(Target{url, host}, {});
+    });
 }
 
 QNetworkProxy proxyFor(const QUrl &url)
@@ -96,6 +174,48 @@ double median(QList<double> values)
     std::sort(values.begin(), values.end());
     const auto n = values.size();
     return n % 2 ? values[n / 2] : (values[n / 2 - 1] + values[n / 2]) / 2.0;
+}
+
+bool isClientError(const QNetworkReply *reply)
+{
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    return status >= 400 && status < 500;
+}
+
+int ServerInfo::ipVersion() const
+{
+    switch (QHostAddress(clientIp).protocol()) {
+    case QAbstractSocket::IPv4Protocol:
+        return 4;
+    case QAbstractSocket::IPv6Protocol:
+        return 6;
+    default:
+        return 0;
+    }
+}
+
+bool updateServerInfo(ServerInfo &info, const QNetworkReply *reply)
+{
+    const ServerInfo before = info;
+    auto take = [reply](QString &field, const char *header) {
+        const QByteArray value = reply->rawHeader(header);
+        if (!value.isEmpty())
+            field = QString::fromUtf8(value).trimmed();
+    };
+    take(info.colo, "cf-meta-colo");
+    take(info.city, "cf-meta-city");
+    take(info.country, "cf-meta-country");
+    take(info.asn, "cf-meta-asn");
+    take(info.clientIp, "cf-meta-ip");
+
+    // CF-RAY: <id>-<colo>
+    if (info.colo.isEmpty()) {
+        const QByteArray ray = reply->rawHeader("cf-ray");
+        const auto dash = ray.lastIndexOf('-');
+        if (dash > 0 && dash + 1 < ray.size())
+            info.colo = QString::fromLatin1(ray.mid(dash + 1)).trimmed();
+    }
+    return !(info == before);
 }
 
 } // namespace http

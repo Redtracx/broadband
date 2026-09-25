@@ -28,9 +28,13 @@ endfunction()
 
 # Measurement engines, LAN test server and Excel report, shared by the app and the tests.
 add_library(broadband_core STATIC
+    src/ContractCheck.cpp
+    src/ContractCheck.h
     src/Format.h
     src/HttpCommon.cpp
     src/HttpCommon.h
+    src/History.cpp
+    src/History.h
     src/LoadTest.cpp
     src/LoadTest.h
     src/Report.cpp
@@ -49,6 +53,8 @@ target_link_libraries(broadband_core PUBLIC Qt6::Network)
 broadband_set_warnings(broadband_core)
 
 qt_add_executable(broadband
+    src/Cli.cpp
+    src/Cli.h
     src/main.cpp
     src/MainWindow.cpp
     src/MainWindow.h

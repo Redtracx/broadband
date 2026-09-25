@@ -2,6 +2,7 @@
 
 #include <QRandomGenerator>
 #include <QTcpSocket>
+#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 
@@ -41,6 +42,24 @@ public:
         connect(m_socket, &QTcpSocket::readyRead, this, &HttpConnection::process);
         connect(m_socket, &QTcpSocket::bytesWritten, this, &HttpConnection::onBytesWritten);
         connect(m_socket, &QTcpSocket::disconnected, m_socket, &QObject::deleteLater);
+
+        // Any traffic in either direction restarts the timer.
+        m_idleTimer.setSingleShot(true);
+        m_idleTimer.setInterval(server->idleTimeoutMs());
+        connect(&m_idleTimer, &QTimer::timeout, m_socket, [socket] {
+            socket->abort();
+            socket->deleteLater();
+        });
+        connect(m_socket, &QTcpSocket::readyRead, &m_idleTimer, qOverload<>(&QTimer::start));
+        connect(m_socket, &QTcpSocket::bytesWritten, &m_idleTimer, qOverload<>(&QTimer::start));
+        m_idleTimer.start();
+
+        // Tell the client which address it connects from, like Cloudflare's
+        // cf-meta-ip; IPv4 clients on a dual-stack socket appear as ::ffff:a.b.c.d.
+        bool isIPv4 = false;
+        const QHostAddress peer = m_socket->peerAddress();
+        const quint32 v4 = peer.toIPv4Address(&isIPv4);
+        m_peer = (isIPv4 ? QHostAddress(v4) : peer).toString().toLatin1();
     }
 
 private:
@@ -166,6 +185,8 @@ private:
         head += "Content-Length: " + QByteArray::number(length) + "\r\n";
         head += "Cache-Control: no-store\r\n";
         head += "Access-Control-Allow-Origin: *\r\n";
+        if (!m_peer.isEmpty())
+            head += "cf-meta-ip: " + m_peer + "\r\n";
         head += m_keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
         m_socket->write(head);
     }
@@ -211,6 +232,8 @@ private:
 
     QTcpSocket *m_socket;
     TestServer *m_server;
+    QTimer m_idleTimer;
+    QByteArray m_peer;
     State m_state = State::Headers;
     QByteArray m_buffer;
     qint64 m_remaining = 0;
@@ -266,6 +289,11 @@ void TestServer::addTraffic(qint64 sent, qint64 received)
 void TestServer::onNewConnection()
 {
     while (QTcpSocket *socket = m_server.nextPendingConnection()) {
+        if (m_connections >= m_maxConnections) {
+            socket->abort();
+            socket->deleteLater();
+            continue;
+        }
         new HttpConnection(socket, this);
         ++m_connections;
         emit connectionCountChanged(m_connections);

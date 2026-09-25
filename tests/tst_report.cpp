@@ -21,6 +21,7 @@ private slots:
     void speedFindingsConsistent();
     void speedFindingsFluke();
     void speedFindingsFallingTrend();
+    void loadedLatencyFindings();
     void loadMedianAndFindings();
 
     void cellReferences();
@@ -201,6 +202,27 @@ void TestReport::speedFindingsFallingTrend()
 
     const QList<Finding> single = report::speedFindings(speedRuns({250}));
     QVERIFY2(hasFinding(single, Finding::Info, QStringLiteral("mindestens 3")), qPrintable(describe(single)));
+}
+
+void TestReport::loadedLatencyFindings()
+{
+    QList<SpeedRun> runs = speedRuns({100, 100, 100});
+    QVERIFY(report::loadedLatencyFindings(runs).isEmpty()); // nothing measured under load
+
+    for (SpeedRun &run : runs) {
+        run.result.downloadLatencyMs = 25.0;
+        run.result.uploadLatencyMs = 40.0;
+    }
+    QList<Finding> findings = report::loadedLatencyFindings(runs);
+    QVERIFY2(hasFinding(findings, Finding::Good, QStringLiteral("25 ms beim Download, 40 ms beim Upload")),
+             qPrintable(describe(findings)));
+
+    runs[1].result.uploadLatencyMs = 400.0;
+    runs[2].result.uploadLatencyMs = 300.0;
+    runs[2].result.retries = 2;
+    findings = report::loadedLatencyFindings(runs);
+    QVERIFY2(hasFinding(findings, Finding::Warning, QStringLiteral("Bufferbloat")), qPrintable(describe(findings)));
+    QVERIFY(hasFinding(findings, Finding::Warning, QStringLiteral("2 Übertragung")));
 }
 
 void TestReport::loadMedianAndFindings()

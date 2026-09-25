@@ -1,4 +1,4 @@
-foreach(name tst_speedtest tst_report)
+foreach(name tst_speedtest tst_report tst_history)
     qt_add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE broadband_core Qt6::Test)
     broadband_set_warnings(${name})
