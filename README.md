@@ -42,14 +42,20 @@ Der Test läuft in drei Phasen:
 
 ### Protokoll
 
-Client und eingebauter Server sprechen dasselbe einfache HTTP-Protokoll wie Cloudflare:
+Das Programm versteht zwei einfache HTTP-Protokolle. Welches verwendet wird, ergibt sich aus der Server-Adresse:
 
 ```
-GET  /__down?bytes=N    → Antwort mit N Bytes
-POST /__up              → Request-Body wird gelesen und verworfen
+Cloudflare (z. B. https://speed.cloudflare.com oder broadband --server)
+GET  /__down?bytes=N        → Antwort mit N Bytes
+POST /__up                  → Request-Body wird gelesen und verworfen
+
+LibreSpeed (Adresse endet auf garbage.php, z. B. https://fra.speedtest.clouvider.net/backend/garbage.php)
+GET  …/garbage.php?ckSize=N → Antwort mit N MiB
+GET  …/empty.php            → leere Antwort (Ping)
+POST …/empty.php            → Request-Body wird gelesen und verworfen
 ```
 
-Deshalb funktioniert jeder kompatible Server als Ziel, sowohl Cloudflare als auch `broadband --server`.
+Deshalb funktioniert jeder kompatible Server als Ziel: Cloudflare, die öffentlichen [LibreSpeed](https://librespeed.org)-Server und `broadband --server`. Der eingebaute Server beherrscht beide Protokolle.
 
 ## Bandbreite unter Last
 
@@ -59,7 +65,8 @@ Der Speedtest zeigt, wie schnell die Leitung **maximal** ist. Im Alltag laden ab
 
 1. Die vertragliche Bandbreite eintragen, z. B. 250 Mbit/s. Das ist optional.
 2. Die Stufen wählen, standardmäßig `1, 2, 4, 8, 16` gleichzeitige Clients, und die Dauer je Stufe festlegen.
-3. **Test starten**
+3. Optional unter **Weitere Server** die Server anpassen, auf die die Clients verteilt werden (siehe unten).
+4. **Test starten**
 
 Zuerst misst das Programm den Ping im Leerlauf. Danach läuft pro Stufe die angegebene Zahl Clients gleichzeitig. Jeder Client hat eine **eigene Verbindung**, verhält sich also wie ein eigenes Gerät. Die Tabelle zeigt pro Stufe:
 
@@ -70,6 +77,16 @@ Zuerst misst das Programm den Ping im Leerlauf. Danach läuft pro Stufe die ange
 | Ø / Min – Max       | Wie viel bekommt jeder einzelne Client, und wie gerecht wird geteilt?           |
 | Ping unter Last     | Reaktionszeit, während die Leitung voll ist (Stichwort *Bufferbloat*)           |
 | Datenmenge          | Übertragene Daten in dieser Stufe                                               |
+
+### Mehrere Testserver
+
+Öffentliche Server begrenzen, wie viele Verbindungen eine einzelne Adresse gleichzeitig aufbauen darf. Bei Cloudflare ist ab etwa **32 gleichzeitigen Clients** Schluss, danach brechen Übertragungen ab. Damit auch Stufen mit 32 oder 64 Clients sauber durchlaufen, verteilt der Lasttest die Clients **reihum** auf den oben eingestellten Server und alle Server unter **Weitere Server**. Bei 64 Clients und 4 Servern bekommt jeder Server also 16 Clients. Der Ping unter Last wird weiterhin gegen den oben eingestellten Server gemessen.
+
+- Voreingestellt sind öffentliche LibreSpeed-Server von Clouvider in Frankfurt, Amsterdam und London. Eine Adresse pro Zeile, Zeilen mit `#` am Anfang werden ignoriert.
+- Vor der ersten Stufe fragt das Programm jeden zusätzlichen Server einmal an. Nicht erreichbare Server werden übersprungen und in der Auswertung genannt, der Test läuft mit den übrigen weiter.
+- Für reproduzierbare Messungen ohne fremde Limits eignen sich eigene Server am besten, z. B. `broadband --server` auf einem oder mehreren VPS bei unterschiedlichen Anbietern. Deren Adressen einfach als weitere Zeilen eintragen.
+- Server weit weg (anderer Kontinent) bremsen einzelne Clients durch die höhere Latenz. Für einen Test des Anschlusses deshalb möglichst nahe Server wählen.
+- Feld leer lassen, um wie bisher nur den oben eingestellten Server zu nutzen.
 
 Darunter steht eine Auswertung in Klartext: ob der Vertrag erreicht wird, ab wie vielen Clients die Leitung voll ist, ob der Gesamtdurchsatz bei vielen Clients einbricht, wie stark der Ping steigt und wie viele GB pro Stunde das entspricht.
 
@@ -140,7 +157,7 @@ scripts/package-windows.sh build-win ~/Qt/6.8.3/mingw_64 \
 
 `package-windows.sh` wertet die Import-Tabellen der exe aus und kopiert nur die DLLs, die tatsächlich geladen werden. Am Ende listet es auch die Windows-Systembibliotheken auf, die das Programm verwendet.
 
-Die CI (`.github/workflows/build.yml`) baut und testet zusätzlich nativ unter Windows und stellt das Ergebnis als Artefakt bereit.
+Die CI (`.github/workflows/build.yml`) baut und testet zusätzlich nativ unter Windows. Bei jedem Push legt sie das fertige ZIP als Vorab-Release `build-<branch>` unter *Releases* ab (wird bei jedem Push ersetzt) und, falls das Speicherkontingent reicht, zusätzlich als Artefakt.
 
 ## Bauen
 
@@ -178,7 +195,7 @@ Installieren (optional): `cmake --install build --prefix ~/.local`
 ### Speedtest
 
 1. `broadband` starten
-2. Oben ist als Server `https://speed.cloudflare.com` voreingestellt. Die Adresse gilt für alle Tests.
+2. Oben ist als Server `https://speed.cloudflare.com` voreingestellt. Die Adresse gilt für alle Tests. In der Liste stehen außerdem einige LibreSpeed-Server, eigene Adressen lassen sich direkt eintippen.
 3. Optional Messdauer (je Richtung), Anzahl paralleler Streams und Wiederholungen anpassen
 4. **Test starten**
 
@@ -221,7 +238,7 @@ broadband übernimmt die Proxy-Einstellungen des Systems, unter Linux also `http
 
 ## Tests
 
-Die Unit-Tests starten einen lokalen Testserver und prüfen die Server-Endpunkte, einen kompletten Speedtest, den Lasttest mit mehreren Stufen, darunter mehr als 6 parallele Clients, jeweils in Download- und Upload-Richtung, das Abbrechen und den Fall, dass keine Verbindung zustande kommt. `tst_report` prüft die Statistik (Median, Ausreißer, Trend), die Auswertungstexte und die erzeugte Excel-Datei bis hinunter zu ZIP-Prüfsummen und gültigem XML. Sie werden automatisch mitgebaut, wenn Qt6 *Test* installiert ist. Unter Debian und Ubuntu ist das in `qt6-base-dev` enthalten.
+Die Unit-Tests starten einen lokalen Testserver und prüfen die Server-Endpunkte beider Protokolle, einen kompletten Speedtest mit Cloudflare- und LibreSpeed-Protokoll, die Verteilung des Lasttests auf mehrere Server samt Überspringen eines nicht erreichbaren Servers, den Lasttest mit mehreren Stufen, darunter mehr als 6 parallele Clients, jeweils in Download- und Upload-Richtung, das Abbrechen und den Fall, dass keine Verbindung zustande kommt. `tst_report` prüft die Statistik (Median, Ausreißer, Trend), die Auswertungstexte und die erzeugte Excel-Datei bis hinunter zu ZIP-Prüfsummen und gültigem XML. Sie werden automatisch mitgebaut, wenn Qt6 *Test* installiert ist. Unter Debian und Ubuntu ist das in `qt6-base-dev` enthalten.
 
 ```bash
 cmake --build build
@@ -264,16 +281,17 @@ Mit `-DBROADBAND_BUILD_TESTS=OFF` lassen sie sich abschalten.
 - Bei sehr schnellen Anschlüssen (≥ 1 Gbit/s) helfen mehr Streams (max. 6, das ist Qts Grenze pro Host) und eine längere Messdauer.
 - Der Upload wird über den Sendefortschritt gemessen. Hinter einem puffernden Proxy kann der Wert deshalb etwas zu hoch ausfallen.
 - Der Ping ist ein **HTTP-Ping** (Request/Response über eine bestehende Verbindung). Er liegt etwas über dem ICMP-`ping`, dafür braucht er keine Root-Rechte.
-- Die Cloudflare-Endpunkte sind nicht offiziell dokumentiert. Bitte nutze sie in Maßen und nicht für Dauermessungen im Minutentakt. Für lange Messreihen eine Pause von einigen Minuten einstellen.
+- Die Cloudflare-Endpunkte sind nicht offiziell dokumentiert. Bitte nutze sie in Maßen und nicht für Dauermessungen im Minutentakt. Für lange Messreihen eine Pause von einigen Minuten einstellen. Das gilt genauso für die öffentlichen LibreSpeed-Server, die von Freiwilligen und Firmen kostenlos betrieben werden.
+- Bei mehreren Servern im Lasttest misst das Programm den Anschluss nur dann richtig, wenn die Server zusammen schneller sind als die Leitung. Ein langsamer Server drückt die Werte seiner Clients nach unten, das zeigt sich in der Spalte *Min – Max je Client*.
 
 ## Sicherheit und Datenschutz
 
 Das Programm ist bewusst klein gehalten und lässt sich vollständig prüfen:
 
-- **Netzwerk:** Es gibt genau drei Arten von Anfragen, ausschließlich an den eingestellten Server (Standard: `speed.cloudflare.com`): `GET /__down?bytes=0` (Ping), `GET /__down?bytes=25000000` (Download), `POST /__up` (Upload). Es gibt keine Telemetrie, keine Update-Prüfung und keine weiteren Hosts. Der Server sieht dabei, wie bei jedem Speedtest, deine IP-Adresse und den User-Agent `broadband/<version>`.
+- **Netzwerk:** Es gibt genau drei Arten von Anfragen, ausschließlich an die eingestellten Server (Standard: `speed.cloudflare.com`, im Lasttest zusätzlich die Server unter *Weitere Server*): Ping, Download und Upload, wie unter [Protokoll](#protokoll) beschrieben. Es gibt keine Telemetrie, keine Update-Prüfung und keine weiteren Hosts. Der Server sieht dabei, wie bei jedem Speedtest, deine IP-Adresse und den User-Agent `broadband/<version>`.
 - **Downloads** landen nur im Arbeitsspeicher, werden gezählt und sofort verworfen. Es wird **nichts auf die Festplatte geschrieben und nichts ausgeführt**.
 - **Uploads** bestehen aus zufällig erzeugten Daten. Es werden nie Dateien oder andere Daten von deinem Rechner gesendet.
-- **Auf der Festplatte** speichert das Programm nur seine Einstellungen (Server, Dauer, Streams, Wiederholungen, Stufen, Vertrag, Port, zuletzt genutzter Export-Ordner) über `QSettings`: unter Linux in `~/.config/broadband/broadband.conf`, unter Windows in der Registry unter `HKCU\Software\broadband`. Dazu kommt der Excel-Bericht, aber nur wenn du ihn über **Excel-Export …** ausdrücklich an einem selbst gewählten Ort speicherst. Er enthält nur Messwerte, Zeitpunkte und die Server-Adresse.
+- **Auf der Festplatte** speichert das Programm nur seine Einstellungen (Server, weitere Server, Dauer, Streams, Wiederholungen, Stufen, Vertrag, Port, zuletzt genutzter Export-Ordner) über `QSettings`: unter Linux in `~/.config/broadband/broadband.conf`, unter Windows in der Registry unter `HKCU\Software\broadband`. Dazu kommt der Excel-Bericht, aber nur wenn du ihn über **Excel-Export …** ausdrücklich an einem selbst gewählten Ort speicherst. Er enthält nur Messwerte, Zeitpunkte und die Server-Adresse.
 - Es werden **keine anderen Programme gestartet** (kein `QProcess`, kein `system()`).
 - **LAN-Server:** Nur solange er ausdrücklich gestartet ist, lauscht er auf allen Netzwerkschnittstellen und ohne Passwort. Er liefert ausschließlich Zufallsdaten und liest nichts von der Platte. Jemand im selben Netz könnte damit aber Bandbreite verbrauchen. Nutze ihn deshalb nur in vertrauenswürdigen Netzen und beende ihn nach dem Test.
 

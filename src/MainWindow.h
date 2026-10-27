@@ -12,6 +12,7 @@
 class QComboBox;
 class QLabel;
 class QLineEdit;
+class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
 class QSpinBox;
@@ -47,6 +48,7 @@ private:
     void loadSettings();
     void saveSettings() const;
     bool serverUrl(QUrl &url);
+    bool extraServers(QList<QUrl> &servers);
     void updateRunningState();
     // Waits between two runs of a series, with a countdown in the status label.
     void startPause(int seconds, QLabel *status, std::function<void()> next);
@@ -73,6 +75,7 @@ private:
     void onLoadStageFinished(int index, const LoadStageResult &result);
     void onLoadFinished();
     void updateContractLine();
+    QString skippedServersHtml() const;
 
     // LAN server
     void toggleServer();
@@ -118,6 +121,7 @@ private:
     QSpinBox *m_contract = nullptr;
     QComboBox *m_loadDirection = nullptr;
     QLineEdit *m_loadStages = nullptr;
+    QPlainTextEdit *m_loadServers = nullptr;
     QSpinBox *m_loadDuration = nullptr;
     QSpinBox *m_loadRuns = nullptr;
     QSpinBox *m_loadPause = nullptr;
@@ -135,6 +139,7 @@ private:
     int m_loadRun = 0;
     int m_loadRunTotal = 0;
     QDateTime m_loadRunStart;
+    QStringList m_loadSkipped; // extra servers that didn't answer in this run
 
     // Server tab
     QSpinBox *m_port = nullptr;

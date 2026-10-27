@@ -14,6 +14,7 @@ constexpr int kMaxHeaderSize = 16 * 1024;
 constexpr qint64 kMaxDownload = 1'000'000'000;
 constexpr qint64 kMaxUpload = 1'000'000'000;
 constexpr qint64 kWriteHighWater = 4 * 1024 * 1024;
+constexpr qint64 kMiB = 1024 * 1024;
 
 // 1 MB of random data that every download response is assembled from.
 const QByteArray &payload()
@@ -126,18 +127,34 @@ private:
         const QUrl url(QString::fromLatin1(target));
         const QString path = url.path();
 
-        if (method == "GET" && path == QLatin1String("/__down")) {
+        // Cloudflare: /__down?bytes=N, /__up; LibreSpeed: /garbage.php?ckSize=N (MiB), /empty.php
+        const bool libreDown = path == QLatin1String("/garbage.php");
+        const bool libreEmpty = path == QLatin1String("/empty.php");
+        if (method == "GET" && (path == QLatin1String("/__down") || libreDown)) {
             bool ok = false;
-            const qint64 bytes = QUrlQuery(url).queryItemValue(QStringLiteral("bytes")).toLongLong(&ok);
+            const QUrlQuery query(url);
+            qint64 bytes = 0;
+            if (libreDown) {
+                const QString size = query.queryItemValue(QStringLiteral("ckSize"));
+                qint64 mib = 4; // LibreSpeed's default
+                ok = true;
+                if (!size.isEmpty())
+                    mib = size.toLongLong(&ok);
+                bytes = mib >= 0 && mib <= kMaxDownload / kMiB ? mib * kMiB : -1;
+            } else {
+                bytes = query.queryItemValue(QStringLiteral("bytes")).toLongLong(&ok);
+            }
             if (!ok || bytes < 0 || bytes > kMaxDownload) {
-                respond(400, "Bad Request", "invalid 'bytes' parameter\n");
+                respond(400, "Bad Request", libreDown ? "invalid 'ckSize' parameter\n" : "invalid 'bytes' parameter\n");
                 return;
             }
             writeHead(200, "OK", bytes, "application/octet-stream");
             m_remaining = bytes;
             m_state = State::Sending;
             pump();
-        } else if (method == "POST" && path == QLatin1String("/__up")) {
+        } else if (method == "GET" && libreEmpty) {
+            respond(200, "OK", "OK\n");
+        } else if (method == "POST" && (path == QLatin1String("/__up") || libreEmpty)) {
             bool ok = false;
             const qint64 length = contentLength.toLongLong(&ok);
             if (chunked || !ok || length < 0) {
