@@ -13,9 +13,7 @@ class QNetworkReply;
 
 struct SpeedTestConfig
 {
-    // Any server speaking the Cloudflare speed test protocol:
-    //   GET  <base>/__down?bytes=N  -> N bytes of payload
-    //   POST <base>/__up            -> body is discarded
+    // Any server speaking the Cloudflare or LibreSpeed protocol, see HttpCommon.h
     QUrl baseUrl{QStringLiteral("https://speed.cloudflare.com")};
     int durationSec = 10; // per transfer phase
     int streams = 4;      // parallel HTTP connections (Qt allows up to 6 per host)

@@ -110,8 +110,7 @@ void SpeedTest::abortAll()
 
 void SpeedTest::sendPing()
 {
-    const QUrl url = http::endpoint(m_config.baseUrl, QStringLiteral("__down"), 0);
-    QNetworkReply *reply = m_nam->get(http::makeRequest(url));
+    QNetworkReply *reply = m_nam->get(http::makeRequest(http::pingUrl(m_config.baseUrl)));
     m_replies.append(reply);
     m_pingTimer.start();
     connect(reply, &QNetworkReply::finished, this, [this, reply] {
@@ -170,8 +169,7 @@ void SpeedTest::launchStream()
     QNetworkReply *reply = nullptr;
 
     if (m_phase == Phase::Download) {
-        reply = m_nam->get(
-            http::makeRequest(http::endpoint(m_config.baseUrl, QStringLiteral("__down"), http::kDownloadChunk)));
+        reply = m_nam->get(http::makeRequest(http::downloadUrl(m_config.baseUrl)));
         connect(reply, &QNetworkReply::readyRead, this, [this, reply] {
             m_bytes += reply->readAll().size();
         });

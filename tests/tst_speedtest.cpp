@@ -21,7 +21,9 @@ private slots:
     void serverUpload();
     void serverRejectsBadRequests_data();
     void serverRejectsBadRequests();
+    void serverLibreSpeed();
 
+    void fullRun_data();
     void fullRun();
     void stopWhileRunning();
     void connectionRefused();
@@ -29,6 +31,8 @@ private slots:
     void loadTestStages_data();
     void loadTestStages();
     void loadTestStop();
+    void loadTestMultipleServers_data();
+    void loadTestMultipleServers();
 
 private:
     QNetworkReply *get(const QString &path);
@@ -104,6 +108,8 @@ void TestSpeedTest::serverRejectsBadRequests_data()
     QTest::newRow("invalid bytes") << QStringLiteral("/__down?bytes=abc") << 400;
     QTest::newRow("negative bytes") << QStringLiteral("/__down?bytes=-5") << 400;
     QTest::newRow("unknown path") << QStringLiteral("/nope") << 404;
+    QTest::newRow("invalid ckSize") << QStringLiteral("/garbage.php?ckSize=abc") << 400;
+    QTest::newRow("negative ckSize") << QStringLiteral("/garbage.php?ckSize=-1") << 400;
 }
 
 void TestSpeedTest::serverRejectsBadRequests()
@@ -114,8 +120,36 @@ void TestSpeedTest::serverRejectsBadRequests()
     QCOMPARE(reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(), status);
 }
 
+void TestSpeedTest::serverLibreSpeed()
+{
+    QScopedPointer<QNetworkReply> download(get(QStringLiteral("/garbage.php?ckSize=3")));
+    QCOMPARE(download->error(), QNetworkReply::NoError);
+    QCOMPARE(download->readAll().size(), qint64(3 * 1024 * 1024));
+
+    QScopedPointer<QNetworkReply> ping(get(QStringLiteral("/empty.php")));
+    QCOMPARE(ping->error(), QNetworkReply::NoError);
+
+    const QByteArray body(1'000'000, 'x');
+    QNetworkRequest request(baseUrl().resolved(QUrl(QStringLiteral("/empty.php"))));
+    request.setHeader(QNetworkRequest::ContentTypeHeader, QByteArray("application/octet-stream"));
+    QScopedPointer<QNetworkReply> upload(m_nam->post(request, body));
+    QSignalSpy finished(upload.data(), &QNetworkReply::finished);
+    QVERIFY(finished.wait(10'000));
+    QCOMPARE(upload->error(), QNetworkReply::NoError);
+    QCOMPARE(m_server->bytesReceived(), qint64(body.size()));
+}
+
+void TestSpeedTest::fullRun_data()
+{
+    QTest::addColumn<QString>("path");
+    QTest::newRow("cloudflare protocol") << QString();
+    QTest::newRow("librespeed protocol") << QStringLiteral("/garbage.php");
+}
+
 void TestSpeedTest::fullRun()
 {
+    QFETCH(QString, path);
+
     SpeedTest test;
     QSignalSpy phases(&test, &SpeedTest::phaseChanged);
     QSignalSpy samples(&test, &SpeedTest::throughputSample);
@@ -123,7 +157,7 @@ void TestSpeedTest::fullRun()
     QSignalSpy failed(&test, &SpeedTest::failed);
 
     SpeedTestConfig config;
-    config.baseUrl = baseUrl();
+    config.baseUrl = baseUrl().resolved(QUrl(path));
     config.durationSec = 1;
     config.streams = 2;
     config.pingCount = 3;
@@ -262,6 +296,62 @@ void TestSpeedTest::loadTestStop()
     QTest::qWait(1500);
     QVERIFY(stageFinished.isEmpty());
     QVERIFY(finished.isEmpty());
+}
+
+void TestSpeedTest::loadTestMultipleServers_data()
+{
+    QTest::addColumn<bool>("upload");
+    QTest::newRow("download") << false;
+    QTest::newRow("upload") << true;
+}
+
+// Clients are spread round-robin over all reachable servers; an unreachable
+// extra server is skipped instead of failing the test.
+void TestSpeedTest::loadTestMultipleServers()
+{
+    QFETCH(bool, upload);
+
+    TestServer second;
+    QVERIFY2(second.start(0, QHostAddress::LocalHost), qPrintable(second.errorString()));
+    TestServer gone;
+    QVERIFY(gone.start(0, QHostAddress::LocalHost));
+    const quint16 gonePort = gone.port();
+    gone.stop();
+
+    const QUrl secondUrl(QStringLiteral("http://127.0.0.1:%1/garbage.php").arg(second.port()));
+    const QUrl goneUrl(QStringLiteral("http://127.0.0.1:%1").arg(gonePort));
+
+    LoadTest test;
+    QSignalSpy unavailable(&test, &LoadTest::serverUnavailable);
+    QSignalSpy ready(&test, &LoadTest::serversReady);
+    QSignalSpy finished(&test, &LoadTest::finished);
+    QSignalSpy failed(&test, &LoadTest::failed);
+
+    LoadTestConfig config;
+    config.baseUrl = baseUrl();
+    config.extraServers = {goneUrl, secondUrl, baseUrl()}; // the main server again is ignored
+    config.stages = {4};
+    config.stageDurationSec = 2;
+    config.upload = upload;
+    test.start(config);
+
+    QVERIFY(finished.wait(30'000));
+    QVERIFY2(failed.isEmpty(), failed.isEmpty() ? "" : qPrintable(failed.first().first().toString()));
+    QCOMPARE(unavailable.size(), 1);
+    QCOMPARE(unavailable.first().first().toUrl(), goneUrl);
+    QCOMPARE(ready.size(), 1);
+    QCOMPARE(test.servers(), (QList<QUrl>{baseUrl(), secondUrl}));
+
+    const QList<LoadStageResult> &results = test.results();
+    QCOMPARE(results.size(), 1);
+    QCOMPARE(results.first().clients, 4);
+    QVERIFY(results.first().clientMinMbps > 0.0); // every client got data
+
+    // Both servers carried transfer traffic, not just a ping.
+    for (const TestServer *server : std::initializer_list<const TestServer *>{m_server, &second}) {
+        const qint64 traffic = upload ? server->bytesReceived() : server->bytesSent();
+        QVERIFY2(traffic > 1'000'000, qPrintable(QStringLiteral("traffic: %1").arg(traffic)));
+    }
 }
 
 QTEST_GUILESS_MAIN(TestSpeedTest)

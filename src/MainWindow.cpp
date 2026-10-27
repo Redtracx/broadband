@@ -19,6 +19,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QNetworkInterface>
+#include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -40,6 +41,14 @@ const QColor kGoodColor(0x2e, 0x9d, 0x4f);
 const QColor kWarnColor(0xd9, 0x82, 0x1e);
 const QColor kBadColor(0xd6, 0x3b, 0x3b);
 const QString kDefaultServer = QStringLiteral("https://speed.cloudflare.com");
+// Public LibreSpeed servers the load test spreads its clients over, in
+// addition to the main server. Cloudflare alone rate-limits from about 32
+// parallel clients of one address.
+const QStringList kDefaultExtraServers{
+    QStringLiteral("https://fra.speedtest.clouvider.net/backend/garbage.php"),
+    QStringLiteral("https://ams.speedtest.clouvider.net/backend/garbage.php"),
+    QStringLiteral("https://lon.speedtest.clouvider.net/backend/garbage.php"),
+};
 
 // Share of the overall progress bar per speed test phase.
 constexpr double kLatencyWeight = 0.1;
@@ -144,10 +153,12 @@ MainWindow::MainWindow(QWidget *parent)
     m_serverUrl = new QComboBox;
     m_serverUrl->setEditable(true);
     m_serverUrl->addItem(kDefaultServer);
+    m_serverUrl->addItems(kDefaultExtraServers);
     m_serverUrl->addItem(QStringLiteral("http://localhost:8080"));
     m_serverUrl->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    m_serverUrl->setToolTip(tr("Cloudflare für Messungen des Internetanschlusses oder die Adresse eines "
-                               "Rechners, auf dem der LAN-Server läuft."));
+    m_serverUrl->setToolTip(tr("Cloudflare oder ein LibreSpeed-Server (Adresse der garbage.php) für Messungen "
+                               "des Internetanschlusses, oder die Adresse eines Rechners, auf dem der "
+                               "LAN-Server läuft."));
     auto *serverRow = new QHBoxLayout;
     serverRow->addWidget(new QLabel(tr("Server:")));
     serverRow->addWidget(m_serverUrl, 1);
@@ -178,12 +189,31 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_load, &LoadTest::idleLatencyMeasured, this, [this](double ms) {
         m_loadStatus->setText(tr("Ping ohne Last: %1 ms").arg(fmt::ms(ms)));
     });
+    connect(m_load, &LoadTest::serverUnavailable, this, [this](const QUrl &server, const QString &error) {
+        m_loadSkipped << tr("%1 (%2)").arg(server.host(), error);
+    });
+    connect(m_load, &LoadTest::serversReady, this, [this](const QList<QUrl> &servers) {
+        if (m_loadRun == 1) {
+            QStringList names;
+            for (const QUrl &server : servers)
+                names << server.toString();
+            m_loadSeries.server = names.join(QStringLiteral(", "));
+        }
+        if (!m_loadSkipped.isEmpty())
+            m_loadSummary->setText(skippedServersHtml());
+        m_loadStatus->setText(tr("Ping ohne Last: %1 ms · %n Server", nullptr, int(servers.size()))
+                                  .arg(fmt::ms(m_load->idleLatencyMs())));
+    });
     // With several runs the chart shows them back to back.
     auto runOffset = [this] { return (m_loadRun - 1) * LoadTest::totalDuration(m_loadConfig); };
     connect(m_load, &LoadTest::stageStarted, this, [this, runOffset](int index, int clients) {
         const QString label = index == 0 && m_loadRun > 1 ? tr("Lauf %1").arg(m_loadRun) : QStringLiteral("%1×").arg(clients);
         m_loadChart->addMarker(runOffset() + index * double(m_loadConfig.stageDurationSec), label);
-        QString status = tr("Stufe %1: %n gleichzeitige(r) Client(s) …", nullptr, clients).arg(index + 1);
+        QString status = tr("Stufe %1: %n gleichzeitige(r) Client(s)", nullptr, clients).arg(index + 1);
+        const int servers = int(m_load->servers().size());
+        if (servers > 1)
+            status += tr(" auf %1 Servern (bis %2 je Server)").arg(servers).arg((clients + servers - 1) / servers);
+        status += QStringLiteral(" …");
         if (m_loadRunTotal > 1)
             status = tr("Durchlauf %1/%2 · ").arg(m_loadRun).arg(m_loadRunTotal) + status;
         m_loadStatus->setText(status);
@@ -407,6 +437,17 @@ QWidget *MainWindow::createLoadTestTab()
     m_loadStages = new QLineEdit(QStringLiteral("1, 2, 4, 8, 16"));
     m_loadStages->setToolTip(tr("Anzahl gleichzeitiger Clients je Stufe, durch Komma getrennt (1–64)"));
 
+    m_loadServers = new QPlainTextEdit(kDefaultExtraServers.join(QLatin1Char('\n')));
+    m_loadServers->setLineWrapMode(QPlainTextEdit::NoWrap);
+    m_loadServers->setPlaceholderText(tr("Eine Adresse pro Zeile, z. B. http://192.168.1.21:8080"));
+    m_loadServers->setFixedHeight(m_loadServers->fontMetrics().lineSpacing() * 4 + 12);
+    m_loadServers->setToolTip(
+        tr("Die Clients werden reihum auf den oben eingestellten Server und diese Server verteilt, damit kein "
+           "einzelner Server alle Verbindungen abbekommt (Cloudflare drosselt ab etwa 32 Clients). Eine Adresse "
+           "pro Zeile: Cloudflare-kompatible Server wie broadband --server oder LibreSpeed-Server (Adresse der "
+           "garbage.php). Nicht erreichbare Server werden übersprungen. Leer lassen, um nur den oben "
+           "eingestellten Server zu nutzen."));
+
     m_loadDuration = new QSpinBox;
     m_loadDuration->setRange(5, 600);
     m_loadDuration->setValue(10);
@@ -439,6 +480,7 @@ QWidget *MainWindow::createLoadTestTab()
     form->addRow(tr("Vertrag:"), m_contract);
     form->addRow(tr("Richtung:"), m_loadDirection);
     form->addRow(tr("Gleichzeitige Clients:"), m_loadStages);
+    form->addRow(tr("Weitere Server:"), m_loadServers);
     form->addRow(tr("Dauer je Stufe:"), m_loadDuration);
     form->addRow(tr("Durchläufe:"), runsRow);
 
@@ -554,6 +596,8 @@ void MainWindow::loadSettings()
     m_contract->setValue(settings.value(QStringLiteral("load/contract"), m_contract->value()).toInt());
     m_loadDirection->setCurrentIndex(settings.value(QStringLiteral("load/upload"), false).toBool() ? 1 : 0);
     m_loadStages->setText(settings.value(QStringLiteral("load/stages"), m_loadStages->text()).toString());
+    m_loadServers->setPlainText(
+        settings.value(QStringLiteral("load/servers"), m_loadServers->toPlainText()).toString());
     m_loadDuration->setValue(settings.value(QStringLiteral("load/duration"), m_loadDuration->value()).toInt());
     m_loadRuns->setValue(settings.value(QStringLiteral("load/runs"), m_loadRuns->value()).toInt());
     m_loadPause->setValue(settings.value(QStringLiteral("load/pause"), m_loadPause->value()).toInt());
@@ -571,6 +615,7 @@ void MainWindow::saveSettings() const
     settings.setValue(QStringLiteral("load/contract"), m_contract->value());
     settings.setValue(QStringLiteral("load/upload"), m_loadDirection->currentIndex() == 1);
     settings.setValue(QStringLiteral("load/stages"), m_loadStages->text());
+    settings.setValue(QStringLiteral("load/servers"), m_loadServers->toPlainText());
     settings.setValue(QStringLiteral("load/duration"), m_loadDuration->value());
     settings.setValue(QStringLiteral("load/runs"), m_loadRuns->value());
     settings.setValue(QStringLiteral("load/pause"), m_loadPause->value());
@@ -586,6 +631,24 @@ bool MainWindow::serverUrl(QUrl &url)
     if (!url.isValid() || (url.scheme() != QLatin1String("http") && url.scheme() != QLatin1String("https"))) {
         QMessageBox::warning(this, windowTitle(), tr("Ungültige Server-Adresse: %1").arg(text));
         return false;
+    }
+    return true;
+}
+
+bool MainWindow::extraServers(QList<QUrl> &servers)
+{
+    servers.clear();
+    const QStringList lines = m_loadServers->toPlainText().split(QLatin1Char('\n'));
+    for (const QString &line : lines) {
+        const QString text = line.trimmed();
+        if (text.isEmpty() || text.startsWith(QLatin1Char('#')))
+            continue;
+        const QUrl url = QUrl::fromUserInput(text);
+        if (!url.isValid() || (url.scheme() != QLatin1String("http") && url.scheme() != QLatin1String("https"))) {
+            QMessageBox::warning(this, windowTitle(), tr("Ungültige Server-Adresse unter „Weitere Server“: %1").arg(text));
+            return false;
+        }
+        servers.append(url);
     }
     return true;
 }
@@ -606,7 +669,8 @@ void MainWindow::updateRunningState()
     m_loadButton->setText(loadRunning ? tr("Stopp") : tr("Test starten"));
     m_loadButton->setEnabled(!speedRunning);
     for (QWidget *widget :
-         std::initializer_list<QWidget *>{m_contract, m_loadDirection, m_loadStages, m_loadDuration, m_loadRuns})
+         std::initializer_list<QWidget *>{m_contract, m_loadDirection, m_loadStages, m_loadServers, m_loadDuration,
+                                          m_loadRuns})
         widget->setEnabled(!loadRunning);
     m_loadPause->setEnabled(!loadRunning && m_loadRuns->value() > 1);
 
@@ -902,7 +966,8 @@ void MainWindow::toggleLoadTest()
     }
 
     QUrl url;
-    if (!serverUrl(url))
+    QList<QUrl> extras;
+    if (!serverUrl(url) || !extraServers(extras))
         return;
 
     const QList<int> stages = parseStages(m_loadStages->text());
@@ -914,12 +979,13 @@ void MainWindow::toggleLoadTest()
 
     m_loadConfig = LoadTestConfig();
     m_loadConfig.baseUrl = url;
+    m_loadConfig.extraServers = extras;
     m_loadConfig.stages = stages;
     m_loadConfig.stageDurationSec = m_loadDuration->value();
     m_loadConfig.upload = m_loadDirection->currentIndex() == 1;
 
     m_loadSeries = LoadSeries();
-    m_loadSeries.server = url.toString();
+    m_loadSeries.server = url.toString(); // completed by serversReady()
     m_loadSeries.upload = m_loadConfig.upload;
     m_loadSeries.contractMbps = m_contract->value();
     m_loadSeries.stageDurationSec = m_loadConfig.stageDurationSec;
@@ -940,11 +1006,19 @@ void MainWindow::startNextLoadRun()
         return;
     ++m_loadRun;
     m_loadRunStart = QDateTime::currentDateTime();
+    m_loadSkipped.clear();
     m_loadStatus->setText(
         (m_loadRunTotal > 1 ? tr("Durchlauf %1/%2 · ").arg(m_loadRun).arg(m_loadRunTotal) : QString()) +
         tr("Messe Ping ohne Last …"));
     m_load->start(m_loadConfig);
     updateRunningState();
+}
+
+QString MainWindow::skippedServersHtml() const
+{
+    return colored(tr("⚠ Nicht erreichbar und übersprungen: %1")
+                       .arg(m_loadSkipped.join(QStringLiteral(", ")).toHtmlEscaped()),
+                   kWarnColor);
 }
 
 void MainWindow::updateContractLine()
@@ -990,6 +1064,8 @@ void MainWindow::onLoadFinished()
     m_loadSeries.runs.append(run);
 
     QString summary = findingsHtml(report::loadFindings(m_loadSeries));
+    if (!m_loadSkipped.isEmpty())
+        summary = skippedServersHtml() + QStringLiteral("<br>") + summary;
     if (m_loadRunTotal > 1) {
         summary = tr("<b>Auswertung nach %1 von %2 Durchläufen</b><br>").arg(m_loadRun).arg(m_loadRunTotal) + summary;
     }

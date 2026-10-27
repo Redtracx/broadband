@@ -32,24 +32,51 @@ bool isLocalHost(const QString &host)
     return (address.toIPv6Address()[0] & 0xfe) == 0xfc; // fc00::/7
 }
 
-} // namespace
+constexpr qint64 kLibreSpeedChunk = 1024 * 1024; // garbage.php counts in MiB
 
-QUrl endpoint(const QUrl &base, const QString &name, qint64 bytes)
+// <base>/<name>, or for LibreSpeed <directory of the script>/<name>
+QUrl endpoint(const QUrl &server, const QString &name, const QString &key = {}, qint64 value = 0)
 {
-    QUrl url = base;
+    QUrl url = server;
     QString path = url.path();
-    if (!path.endsWith(QLatin1Char('/')))
+    if (isLibreSpeed(server))
+        path.truncate(path.lastIndexOf(QLatin1Char('/')) + 1);
+    else if (!path.endsWith(QLatin1Char('/')))
         path += QLatin1Char('/');
     url.setPath(path + name);
 
-    if (bytes >= 0) {
+    if (!key.isEmpty()) {
         QUrlQuery query;
-        query.addQueryItem(QStringLiteral("bytes"), QString::number(bytes));
+        query.addQueryItem(key, QString::number(value));
         url.setQuery(query);
     } else {
         url.setQuery(QString());
     }
     return url;
+}
+
+} // namespace
+
+bool isLibreSpeed(const QUrl &server)
+{
+    const QString path = server.path();
+    return path.endsWith(QLatin1String("/garbage.php"), Qt::CaseInsensitive)
+        || path.endsWith(QLatin1String("/empty.php"), Qt::CaseInsensitive);
+}
+
+QUrl pingUrl(const QUrl &server)
+{
+    return isLibreSpeed(server) ? endpoint(server, QStringLiteral("empty.php"))
+                                : endpoint(server, QStringLiteral("__down"), QStringLiteral("bytes"), 0);
+}
+
+QUrl downloadUrl(const QUrl &server)
+{
+    if (isLibreSpeed(server)) {
+        return endpoint(server, QStringLiteral("garbage.php"), QStringLiteral("ckSize"),
+                        kDownloadChunk / kLibreSpeedChunk);
+    }
+    return endpoint(server, QStringLiteral("__down"), QStringLiteral("bytes"), kDownloadChunk);
 }
 
 QNetworkRequest makeRequest(const QUrl &url)
@@ -66,9 +93,10 @@ QNetworkRequest makeRequest(const QUrl &url)
     return request;
 }
 
-QNetworkRequest makeUploadRequest(const QUrl &base)
+QNetworkRequest makeUploadRequest(const QUrl &server)
 {
-    QNetworkRequest request = makeRequest(endpoint(base, QStringLiteral("__up")));
+    const QString name = isLibreSpeed(server) ? QStringLiteral("empty.php") : QStringLiteral("__up");
+    QNetworkRequest request = makeRequest(endpoint(server, name));
     request.setHeader(QNetworkRequest::ContentTypeHeader, QByteArray("application/octet-stream"));
     return request;
 }

@@ -34,6 +34,7 @@ LoadTest::LoadTest(QObject *parent)
 LoadTest::~LoadTest()
 {
     abortPing();
+    abortChecks();
     teardownClients();
 }
 
@@ -58,6 +59,8 @@ void LoadTest::start(const LoadTestConfig &config)
     m_idlePhase = true;
     m_idlePings.clear();
     m_idlePingsDone = 0;
+    m_servers = {m_config.baseUrl};
+    m_checkedServers.clear();
 
     if (m_config.stages.isEmpty()) {
         fail(tr("Keine Laststufen angegeben."));
@@ -80,6 +83,7 @@ void LoadTest::stop()
     m_stageActive = false;
     m_sampleTimer.stop();
     abortPing();
+    abortChecks();
     teardownClients();
     emit stopped();
 }
@@ -91,6 +95,7 @@ void LoadTest::fail(const QString &message)
     m_stageActive = false;
     m_sampleTimer.stop();
     abortPing();
+    abortChecks();
     teardownClients();
     emit failed(message);
 }
@@ -103,6 +108,16 @@ void LoadTest::abortPing()
     m_pingReply->abort();
     m_pingReply->deleteLater();
     m_pingReply = nullptr;
+}
+
+void LoadTest::abortChecks()
+{
+    const auto checks = std::exchange(m_checks, {});
+    for (QNetworkReply *reply : checks) {
+        reply->disconnect(this);
+        reply->abort();
+        reply->manager()->deleteLater(); // also deletes the reply
+    }
 }
 
 void LoadTest::teardownClients()
@@ -122,8 +137,7 @@ void LoadTest::teardownClients()
 
 void LoadTest::sendPing()
 {
-    const QUrl url = http::endpoint(m_config.baseUrl, QStringLiteral("__down"), 0);
-    m_pingReply = m_pingNam->get(http::makeRequest(url));
+    m_pingReply = m_pingNam->get(http::makeRequest(http::pingUrl(m_config.baseUrl)));
     m_pingTimer.start();
     connect(m_pingReply, &QNetworkReply::finished, this, [this] {
         const double elapsedMs = double(m_pingTimer.nsecsElapsed()) / 1e6;
@@ -154,7 +168,7 @@ void LoadTest::onPingFinished(double elapsedMs)
         m_idlePhase = false;
         m_idleLatencyMs = http::median(m_idlePings);
         emit idleLatencyMeasured(m_idleLatencyMs);
-        startStage(0);
+        checkExtraServers();
         return;
     }
 
@@ -166,6 +180,42 @@ void LoadTest::onPingFinished(double elapsedMs)
         if (runId == m_runId && m_stageActive && !m_pingReply)
             sendPing();
     });
+}
+
+// One request to every extra server, all at once. Servers that don't answer
+// are left out instead of failing the whole test.
+void LoadTest::checkExtraServers()
+{
+    for (const QUrl &server : std::as_const(m_config.extraServers)) {
+        if (m_servers.contains(server) || m_checkedServers.contains(server))
+            continue;
+        auto *nam = new QNetworkAccessManager(this);
+        nam->setProxy(http::proxyFor(server));
+        QNetworkReply *reply = nam->get(http::makeRequest(http::pingUrl(server)));
+        m_checks.append(reply);
+        m_checkedServers.append(server); // reachable ones stay, see below
+        connect(reply, &QNetworkReply::finished, this, [this, reply, nam, server] {
+            m_checks.removeOne(reply);
+            nam->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
+                m_checkedServers.removeOne(server);
+                emit serverUnavailable(server, reply->errorString());
+            }
+            if (m_checks.isEmpty()) {
+                // Keep the configured order.
+                for (const QUrl &extra : std::as_const(m_config.extraServers)) {
+                    if (m_checkedServers.contains(extra) && !m_servers.contains(extra))
+                        m_servers.append(extra);
+                }
+                emit serversReady(m_servers);
+                startStage(0);
+            }
+        });
+    }
+    if (m_checks.isEmpty()) {
+        emit serversReady(m_servers);
+        startStage(0);
+    }
 }
 
 // --- Stages -----------------------------------------------------------------
@@ -183,14 +233,14 @@ void LoadTest::startStage(int index)
     m_window = {{0, 0}};
 
     m_stageTimer.start();
-    const QNetworkProxy proxy = http::proxyFor(m_config.baseUrl);
     for (int i = 0; i < clients; ++i) {
         // A separate access manager per client: each one behaves like its own
         // device with its own connection (and Qt's limit of six connections
         // per host applies per manager).
         auto *client = new Client;
+        client->server = m_servers[i % m_servers.size()];
         client->nam = new QNetworkAccessManager(this);
-        client->nam->setProxy(proxy);
+        client->nam->setProxy(http::proxyFor(client->server));
         m_clients.append(client);
         launch(client);
     }
@@ -205,7 +255,7 @@ void LoadTest::launch(Client *client)
     QNetworkReply *reply = nullptr;
     if (m_config.upload) {
         client->uploadSent = 0;
-        reply = client->nam->post(http::makeUploadRequest(m_config.baseUrl), http::uploadPayload());
+        reply = client->nam->post(http::makeUploadRequest(client->server), http::uploadPayload());
         connect(reply, &QNetworkReply::uploadProgress, this, [client](qint64 sent, qint64) {
             if (sent > client->uploadSent) {
                 client->bytes += sent - client->uploadSent;
@@ -213,8 +263,7 @@ void LoadTest::launch(Client *client)
             }
         });
     } else {
-        const QUrl url = http::endpoint(m_config.baseUrl, QStringLiteral("__down"), http::kDownloadChunk);
-        reply = client->nam->get(http::makeRequest(url));
+        reply = client->nam->get(http::makeRequest(http::downloadUrl(client->server)));
         connect(reply, &QNetworkReply::readyRead, this, [client, reply] {
             client->bytes += reply->readAll().size();
         });
@@ -225,9 +274,9 @@ void LoadTest::launch(Client *client)
         client->reply = nullptr;
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
-            fail(tr("Übertragung fehlgeschlagen (%1 gleichzeitige Clients): %2")
+            fail(tr("Übertragung fehlgeschlagen (%1 gleichzeitige Clients, Server %2): %3")
                      .arg(m_config.stages.value(m_stageIndex))
-                     .arg(reply->errorString()));
+                     .arg(client->server.host(), reply->errorString()));
             return;
         }
         launch(client);

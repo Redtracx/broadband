@@ -12,7 +12,12 @@ class QNetworkReply;
 
 struct LoadTestConfig
 {
-    QUrl baseUrl{QStringLiteral("https://speed.cloudflare.com")};
+    QUrl baseUrl{QStringLiteral("https://speed.cloudflare.com")}; // also used for the ping
+    // Further servers the clients are spread across (round-robin together
+    // with baseUrl), so no single server sees all of them. Public servers
+    // like Cloudflare rate-limit many parallel connections from one address.
+    // Unreachable servers are skipped before the first stage.
+    QList<QUrl> extraServers;
     QList<int> stages{1, 2, 4, 8, 16}; // simultaneous clients per stage
     int stageDurationSec = 10;
     bool upload = false;
@@ -44,6 +49,7 @@ public:
     ~LoadTest() override;
 
     bool isRunning() const { return m_running; }
+    const QList<QUrl> &servers() const { return m_servers; }
     double idleLatencyMs() const { return m_idleLatencyMs; }
     const QList<LoadStageResult> &results() const { return m_results; }
 
@@ -56,6 +62,8 @@ public slots:
 
 signals:
     void idleLatencyMeasured(double ms);
+    void serverUnavailable(const QUrl &server, const QString &error); // skipped extra server
+    void serversReady(const QList<QUrl> &servers);                   // used for all stages
     void stageStarted(int index, int clients);
     void sample(double seconds, double totalMbps); // seconds since the first stage started
     void progressChanged(double fraction);         // 0..1 over the whole run
@@ -69,6 +77,7 @@ private:
     {
         QNetworkAccessManager *nam = nullptr;
         QNetworkReply *reply = nullptr;
+        QUrl server;
         qint64 bytes = 0;
         qint64 warmupBytes = 0;
         qint64 uploadSent = 0; // progress of the current upload request
@@ -76,10 +85,12 @@ private:
 
     void fail(const QString &message);
     void abortPing();
+    void abortChecks();
     void teardownClients();
 
     void sendPing();
     void onPingFinished(double elapsedMs);
+    void checkExtraServers();
 
     void startStage(int index);
     void launch(Client *client);
@@ -99,6 +110,10 @@ private:
     QList<double> m_stagePings;
     int m_idlePingsDone = 0;
     double m_idleLatencyMs = 0.0;
+
+    QList<QUrl> m_servers;              // reachable servers, baseUrl first
+    QList<QNetworkReply *> m_checks;    // reachability checks of extra servers
+    QList<QUrl> m_checkedServers;       // extra servers that answered
 
     int m_stageIndex = -1;
     QList<Client *> m_clients;
