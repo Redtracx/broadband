@@ -28,6 +28,8 @@ jobs:
 
   windows:
     runs-on: windows-2022
+    permissions:
+      contents: write # publish the zip as a pre-release, see below
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +67,25 @@ jobs:
             --no-system-d3d-compiler dist/broadband/broadband.exe
           cp LICENSE dist/broadband/LICENSE.txt
 
+      # A full artifact storage quota must not fail an otherwise green build;
+      # the pre-release below doesn't count against that quota.
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: broadband-windows-x64
           path: dist/broadband
+
+      # Pushed branches get a pre-release "build-<branch>" with the zip, which
+      # is replaced on every push. Download it from the repository's Releases page.
+      - name: Publish pre-release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-${GITHUB_REF_NAME//\//-}"
+          (cd dist && 7z a -tzip ../broadband-windows-x64.zip broadband > /dev/null)
+          gh release delete "$tag" --yes --cleanup-tag || true
+          gh release create "$tag" broadband-windows-x64.zip --prerelease --target "$GITHUB_SHA" \
+            --title "Windows-Build ($GITHUB_REF_NAME)" \
+            --notes "Automatischer Build von $GITHUB_SHA. ZIP entpacken und broadband.exe starten."

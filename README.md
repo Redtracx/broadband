@@ -157,7 +157,7 @@ scripts/package-windows.sh build-win ~/Qt/6.8.3/mingw_64 \
 
 `package-windows.sh` wertet die Import-Tabellen der exe aus und kopiert nur die DLLs, die tatsächlich geladen werden. Am Ende listet es auch die Windows-Systembibliotheken auf, die das Programm verwendet.
 
-Die CI (`.github/workflows/build.yml`) baut und testet zusätzlich nativ unter Windows und stellt das Ergebnis als Artefakt bereit.
+Die CI (`.github/workflows/build.yml`) baut und testet zusätzlich nativ unter Windows. Bei jedem Push legt sie das fertige ZIP als Vorab-Release `build-<branch>` unter *Releases* ab (wird bei jedem Push ersetzt) und, falls das Speicherkontingent reicht, zusätzlich als Artefakt.
 
 ## Bauen
 
